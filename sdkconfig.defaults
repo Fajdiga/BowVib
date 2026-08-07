@@ -1,0 +1,30 @@
+# BowVib — ESP32-S3 + IIS3DWB10IS vibration capture
+# Target: ESP32-S3-DevKitC-1 (octal PSRAM), ESP-IDF v6.x
+CONFIG_IDF_TARGET="esp32s3"
+
+# CPU
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Flash (board is "N32" -> 32 MB). If your module is smaller, lower this.
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+
+# Custom partition table (single large factory app)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Octal PSRAM
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCTAL=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# Console stays on UART0 (the "UART" USB-C port). The native "USB" port
+# (USB-Serial-JTAG) is left free for the command + binary-data channel.
+# (Boot logs / ESP_LOG go to UART; capture.py talks to USB.)
+
+# A bit more main-task stack
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192

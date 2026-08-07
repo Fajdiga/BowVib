@@ -1,0 +1,13 @@
+# ESP-IDF build output
+build/
+managed_components/
+dependencies.lock
+
+# Generated sdkconfig (keep sdkconfig.defaults)
+sdkconfig
+sdkconfig.old
+
+# Editor / machine-local
+.vscode/
+.claude/
+.cache/

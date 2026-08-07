@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "iis3dwb10is.c"
+        "capture.c"
+        "usb.c"
+    INCLUDE_DIRS
+        "."
+)
