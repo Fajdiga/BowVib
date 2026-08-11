@@ -11,3 +11,11 @@ sdkconfig.old
 .vscode/
 .claude/
 .cache/
+
+# Python caches and generated IMU captures
+__pycache__/
+*.py[cod]
+*.npy
+*.npz
+*.csv
+!partitions.csv

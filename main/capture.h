@@ -6,8 +6,9 @@
  *           (primary: matches "store onboard until memory full, a few seconds")
  *   STREAM  drain the FIFO straight to USB continuously (fallback).
  *
- * The FIFO watermark interrupt (INT1) wakes the capture task, which bulk-reads
- * rows directly into PSRAM (or the USB scratch for STREAM).
+ * Low ODR captures use INT1/XLDA plus direct DMA reads; high ODR captures use
+ * the FIFO watermark and bulk DMA reads. XLDA polling is a board-wiring
+ * fallback when INT1 is not connected.
  */
 #pragma once
 
