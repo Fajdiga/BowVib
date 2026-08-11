@@ -74,7 +74,15 @@ def decode_rows(data: bytes | bytearray | memoryview) -> np.ndarray:
     invalid = np.flatnonzero(rows[:, 0] != ACCEL_TAG)
     if invalid.size:
         index = int(invalid[0])
-        raise ValueError(f"invalid FIFO tag 0x{rows[index, 0]:02x} at row {index}")
+        tags, counts = np.unique(rows[invalid, 0], return_counts=True)
+        summary = ", ".join(
+            f"0x{int(tag):02x}:{int(count):,}"
+            for tag, count in zip(tags[:6], counts[:6], strict=True)
+        )
+        raise ValueError(
+            f"invalid FIFO tag 0x{rows[index, 0]:02x} at row {index}; "
+            f"{invalid.size:,}/{len(rows):,} rows invalid ({summary})"
+        )
 
     xyz = np.empty((len(rows), 3), dtype=np.int32)
     for axis, offset in enumerate((1, 4, 7)):
@@ -585,7 +593,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="PSRAM recording duration (default: 10 seconds)",
     )
     parser.add_argument(
-        "--rate", type=float, help="sample rate in Hz (capture default: 40000)"
+        "--rate", type=float, help="sample rate in Hz (capture default: 80000)"
     )
     parser.add_argument("--fs", type=int, choices=(50, 100, 200), default=50)
     parser.add_argument("--save", type=Path, help="capture output (default: raw_capture.npz)")
@@ -610,7 +618,7 @@ def main() -> int:
 
     try:
         if args.port:
-            capture_rate = int(args.rate or 40000)
+            capture_rate = int(args.rate or 80000)
             if capture_rate not in ODR_CHOICES:
                 parser.error("capture --rate must be one of " + ", ".join(map(str, ODR_CHOICES)))
             output = args.save or Path("raw_capture.npz")

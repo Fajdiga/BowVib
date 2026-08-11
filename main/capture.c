@@ -20,6 +20,7 @@ static const char *TAG = "capture";
 #define CAP_MAX_BYTES   (8u * 1024u * 1024u)
 #define STREAM_ROWS     400u          /* rows per STREAM chunk (4000 bytes) */
 #define STREAM_BUFFERS  3u            /* overlap SPI reads with USB writes */
+#define STORE_DRAIN_LOW (FIFO_WATERMARK / 2u)
 
 typedef enum { CAP_IDLE, CAP_STORE, CAP_STREAM } cap_mode_t;
 
@@ -38,7 +39,7 @@ static QueueHandle_t s_stream_ready;
 
 static int64_t s_store_start_us;
 static uint32_t s_store_dur_ms;
-static iis3dwb10is_odr_t s_last_odr = IIS3DWB10IS_ODR_40K;
+static iis3dwb10is_odr_t s_last_odr = IIS3DWB10IS_ODR_80K;
 static iis3dwb10is_fs_t  s_last_fs  = IIS3DWB10IS_FS_50G;
 
 /* STREAM buffers stay in internal RAM for SPI DMA. */
@@ -198,7 +199,11 @@ static void capture_task(void *arg)
             continue;
         }
 
-        uint32_t events = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+        /* CONFIG_FREERTOS_HZ is 100, so a nominal 5 ms conversion is zero
+           ticks and would busy-loop, starving IDLE1 and its watchdog. One
+           tick gives IDLE1 10 ms while the sensor FIFO absorbs ~800 rows. */
+        TickType_t wait_ticks = pdMS_TO_TICKS(10);
+        uint32_t events = ulTaskNotifyTake(pdTRUE, wait_ticks);
         const bool got_events = events != 0;
 
         if (s_mode == CAP_STORE) {
@@ -215,17 +220,29 @@ static void capture_task(void *arg)
                     direct_poll_fallback(false);
                 }
             } else {
+                /* FIFO interrupts are deliberately disabled because sustained
+                   watermark edges reset this sensor/board at 80 kS/s. Poll at
+                   one RTOS tick and drain below half the watermark. */
                 uint16_t lvl = iis3dwb10is_fifo_level();
-                if (lvl) {
+                while (lvl) {
                     uint32_t free_rows = (s_cap_bytes - s_write_idx) / FIFO_ROW_BYTES;
                     uint16_t n = (lvl > free_rows) ? (uint16_t)free_rows : lvl;
-                    if (n) {
-                        iis3dwb10is_fifo_read(s_buf + s_write_idx, n);
-                        s_write_idx += (uint32_t)n * FIFO_ROW_BYTES;
-                        s_rows += n;
-                        if (iis3dwb10is_fifo_overrun()) {
-                            s_overrun = true;
-                        }
+                    if (!n) {
+                        break;
+                    }
+                    iis3dwb10is_fifo_read(s_buf + s_write_idx, n);
+                    s_write_idx += (uint32_t)n * FIFO_ROW_BYTES;
+                    s_rows += n;
+                    if (iis3dwb10is_fifo_overrun()) {
+                        s_overrun = true;
+                    }
+                    if (s_stop_req ||
+                        s_write_idx + FIFO_ROW_BYTES > s_cap_bytes) {
+                        break;
+                    }
+                    lvl = iis3dwb10is_fifo_level();
+                    if (lvl < STORE_DRAIN_LOW) {
+                        break;
                     }
                 }
             }
@@ -400,9 +417,9 @@ esp_err_t capture_init(void)
                             configMAX_PRIORITIES - 3, NULL, 0);
     iis3dwb10is_set_int1_callback(on_int1, NULL);
 
-    ESP_LOGI(TAG, "PSRAM %lu KB, capture buffer %lu KB (%lu rows, ~%lu s @40kHz)",
+    ESP_LOGI(TAG, "PSRAM %lu KB, capture buffer %lu KB (%lu rows, ~%lu s @80kHz)",
              (unsigned long)(psz / 1024), (unsigned long)(cap / 1024),
              (unsigned long)(cap / FIFO_ROW_BYTES),
-             (unsigned long)(cap / FIFO_ROW_BYTES / 40000));
+             (unsigned long)(cap / FIFO_ROW_BYTES / 80000));
     return ESP_OK;
 }

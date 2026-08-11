@@ -14,6 +14,7 @@
 static const char *TAG = "iis3dwb10is";
 
 static spi_device_handle_t s_spi;
+static int s_spi_khz;
 static bool s_direct_mode;
 static bool s_fifo_overrun_latched;
 static iis3dwb10is_bits_t s_output_bits = IIS3DWB10IS_BITS_20;
@@ -22,16 +23,23 @@ static iis3dwb10is_bits_t s_output_bits = IIS3DWB10IS_BITS_20;
 static iis3dwb10is_int1_cb_t s_int1_cb;
 static void                  *s_int1_arg;
 
-/* Internal DMA-capable scratch for large FIFO bulk reads (1 + 4000 bytes). */
-#define ROWS_PER_XFER 400
-static uint8_t DRAM_ATTR s_tx[ROWS_PER_XFER * FIFO_ROW_BYTES + 1];
-static uint8_t DRAM_ATTR s_rx[ROWS_PER_XFER * FIFO_ROW_BYTES + 1];
+/* Keep FIFO DMA payloads at 1000 bytes. The register address is sent in the
+   SPI command phase, so the DMA buffers contain only complete 10-byte rows. */
+#define ROWS_PER_XFER 100
+static uint8_t DRAM_ATTR s_tx[ROWS_PER_XFER * FIFO_ROW_BYTES];
+static uint8_t DRAM_ATTR s_rx[ROWS_PER_XFER * FIFO_ROW_BYTES];
 
 /* One direct XYZ read is 12 bytes (four sign-extended bytes per axis), plus
    the command byte.  Keep both buffers in internal DMA-capable RAM. */
 #define DIRECT_DATA_BYTES 12U
 static uint8_t DRAM_ATTR s_direct_tx[DIRECT_DATA_BYTES + 1];
 static uint8_t DRAM_ATTR s_direct_rx[DIRECT_DATA_BYTES + 1];
+
+/* Centralized transaction helper. */
+static esp_err_t spi_transmit(spi_device_handle_t device, spi_transaction_t *t)
+{
+    return spi_device_polling_transmit(device, t);
+}
 
 float iis3dwb10is_fs_to_mglsb(iis3dwb10is_fs_t fs)
 {
@@ -61,7 +69,7 @@ uint8_t iis3dwb10is_read(uint8_t reg)
     spi_transaction_t t = {
         .length = 16, .tx_buffer = tx, .rx_buffer = rx,
     };
-    spi_device_polling_transmit(s_spi, &t);
+    spi_transmit(s_spi, &t);
     return rx[1];
 }
 
@@ -71,7 +79,7 @@ void iis3dwb10is_write(uint8_t reg, uint8_t val)
     spi_transaction_t t = {
         .length = 16, .tx_buffer = tx, .rx_buffer = NULL,
     };
-    spi_device_polling_transmit(s_spi, &t);
+    spi_transmit(s_spi, &t);
 }
 
 void iis3dwb10is_read_burst(uint8_t reg, uint8_t *dst, uint16_t len)
@@ -82,7 +90,7 @@ void iis3dwb10is_read_burst(uint8_t reg, uint8_t *dst, uint16_t len)
     spi_transaction_t t = {
         .length = (uint32_t)(1 + len) * 8, .tx_buffer = tx, .rx_buffer = rx,
     };
-    spi_device_polling_transmit(s_spi, &t);
+    spi_transmit(s_spi, &t);
     memcpy(dst, rx + 1, len);
 }
 
@@ -120,26 +128,30 @@ void iis3dwb10is_fifo_flush_running(void)
     /* Bypass clears the complete FIFO immediately while the accelerometer
        remains in continuous mode. Entering bypass also clears FIFO_EN on this
        part, so restore stream/batching first and then re-enable FIFO_EN. */
-    iis3dwb10is_write(REG_FIFO_CTRL3, 0x00);
+    iis3dwb10is_write(REG_FIFO_CTRL3, FIFO_CTRL3_MODE_BYPASS);
     esp_rom_delay_us(50);
     iis3dwb10is_fifo_clear_overrun();
-    iis3dwb10is_write(REG_FIFO_CTRL3, 0x02 | 0x08);
+    iis3dwb10is_write(REG_FIFO_CTRL3,
+                      FIFO_CTRL3_XL_BATCH | FIFO_CTRL3_MODE_CONTINUOUS);
     iis3dwb10is_write(REG_CTRL3, CTRL3_BDU | CTRL3_FIFO_EN | CTRL3_IF_INC);
 }
 
 void iis3dwb10is_fifo_read(uint8_t *dst, uint16_t nrows)
 {
     uint16_t off = 0;
-    s_tx[0] = (uint8_t)(REG_FIFO_OUT | 0x80);
     while (nrows) {
         uint16_t n = (nrows > ROWS_PER_XFER) ? ROWS_PER_XFER : nrows;
         uint16_t len = n * FIFO_ROW_BYTES;
-        spi_transaction_t t = { 0 };
-        t.length = (uint32_t)(1 + len) * 8;
-        t.tx_buffer = s_tx;
-        t.rx_buffer = s_rx;
-        spi_device_polling_transmit(s_spi, &t);
-        memcpy(dst + off, s_rx + 1, len);   /* dst may be PSRAM (CPU copy; DMA can't reach it) */
+        spi_transaction_ext_t t = { 0 };
+        t.base.flags = SPI_TRANS_VARIABLE_CMD;
+        t.base.cmd = (uint16_t)(REG_FIFO_OUT | 0x80U);
+        t.base.length = (uint32_t)len * 8U;
+        t.base.rxlength = (uint32_t)len * 8U;
+        t.base.tx_buffer = s_tx;
+        t.base.rx_buffer = s_rx;
+        t.command_bits = 8;
+        spi_transmit(s_spi, &t.base);
+        memcpy(dst + off, s_rx, len);   /* dst may be PSRAM (CPU copy; DMA can't reach it) */
         off += len;
         nrows -= n;
     }
@@ -153,13 +165,11 @@ void iis3dwb10is_start(iis3dwb10is_odr_t odr, iis3dwb10is_fs_t fs)
                      odr == IIS3DWB10IS_ODR_5K ||
                      odr == IIS3DWB10IS_ODR_10K);
     iis3dwb10is_write(REG_CTRL1, IIS3DWB10IS_ODR_IDLE);       /* pause */
-    /* ODR transitions require at least 0.45 ms with no serial activity. */
-    esp_rom_delay_us(500);
     iis3dwb10is_write(REG_CTRL2, (uint8_t)(fs << 5));         /* full-scale */
     /* Autoswitch selects the datasheet-recommended LPF1 for each ODR and the
        full 20 kHz LPF1 setting at 40/80 kS/s. */
     iis3dwb10is_write(REG_ST_CTRL, ST_CTRL_LPF1_AUTO);
-    iis3dwb10is_write(REG_FIFO_CTRL3, 0x00);                  /* bypass = flush FIFO */
+    iis3dwb10is_write(REG_FIFO_CTRL3, FIFO_CTRL3_MODE_BYPASS); /* flush FIFO */
     esp_rom_delay_us(50);
     iis3dwb10is_fifo_clear_overrun();
     if (s_direct_mode) {
@@ -170,12 +180,19 @@ void iis3dwb10is_start(iis3dwb10is_odr_t odr, iis3dwb10is_fs_t fs)
                                        CTRL4_ROUNDING_16 : 0U)));
         iis3dwb10is_write(REG_INT_CTRL2, INT1_DRDY_XL);
     } else {
-        iis3dwb10is_write(REG_FIFO_CTRL3, 0x02 | 0x08);       /* STREAM + XL batch */
+        iis3dwb10is_write(REG_FIFO_CTRL3,
+                          FIFO_CTRL3_XL_BATCH | FIFO_CTRL3_MODE_CONTINUOUS);
         /* Entering bypass clears FIFO_EN on this part. Re-enable it after the
            FIFO mode write, as ST's fifo_mode_set() implementation does. */
         iis3dwb10is_write(REG_CTRL3, CTRL3_BDU | CTRL3_FIFO_EN | CTRL3_IF_INC);
-        iis3dwb10is_write(REG_INT_CTRL2, INT1_FIFO_TH);
+        /* Do not drive FIFO events onto INT1. Sustained 80 kS/s testing showed
+           the sensor resetting after a variable number of watermark edges.
+           The capture task polls the 2048-row FIFO every RTOS tick instead. */
+        iis3dwb10is_write(REG_INT_CTRL2, 0x00);
     }
+    /* ODR transitions require at least 0.45 ms of serial-interface silence
+       immediately before the ODR write, after all other configuration. */
+    esp_rom_delay_us(500);
     iis3dwb10is_write(REG_CTRL1, (uint8_t)odr);               /* continuous @ odr */
 }
 
@@ -183,7 +200,7 @@ void iis3dwb10is_stop(void)
 {
     iis3dwb10is_write(REG_INT_CTRL2, 0x00);                   /* disable INT1 */
     iis3dwb10is_write(REG_CTRL1, IIS3DWB10IS_ODR_IDLE);
-    iis3dwb10is_write(REG_FIFO_CTRL3, 0x00);                  /* bypass/flush */
+    iis3dwb10is_write(REG_FIFO_CTRL3, FIFO_CTRL3_MODE_BYPASS); /* bypass/flush */
     s_direct_mode = false;
 }
 
@@ -202,6 +219,8 @@ iis3dwb10is_bits_t iis3dwb10is_output_bits(void)
 {
     return s_output_bits;
 }
+
+int iis3dwb10is_spi_khz(void) { return s_spi_khz; }
 
 bool iis3dwb10is_data_ready(void)
 {
@@ -312,9 +331,22 @@ esp_err_t iis3dwb10is_init(void)
     };
     ESP_ERROR_CHECK(spi_bus_initialize(IIS3DWB10IS_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO));
     ESP_ERROR_CHECK(spi_bus_add_device(IIS3DWB10IS_SPI_HOST, &devcfg, &s_spi));
+    ESP_ERROR_CHECK(spi_device_get_actual_freq(s_spi, &s_spi_khz));
 
-    /* INT1: input, pull-down, rising edge = DRDY (direct mode) or FIFO
-       watermark (high-rate mode). */
+    /* Software edge reduction was tested at the two weaker drive settings,
+       but both caused missed/corrupted FIFO traffic. Use the normal setting;
+       MISO is driven by the sensor and cannot be adjusted from the ESP32. */
+    ESP_ERROR_CHECK(gpio_set_drive_capability(IIS3DWB10IS_PIN_SCK,
+                                               GPIO_DRIVE_CAP_2));
+    ESP_ERROR_CHECK(gpio_set_drive_capability(IIS3DWB10IS_PIN_MOSI,
+                                               GPIO_DRIVE_CAP_2));
+    ESP_ERROR_CHECK(gpio_set_drive_capability(IIS3DWB10IS_PIN_CS,
+                                               GPIO_DRIVE_CAP_2));
+    ESP_LOGI(TAG, "SPI=%d kHz for registers and FIFO, drive=normal", s_spi_khz);
+
+    /* INT1 is used for data-ready in low-rate direct-register mode. High-rate
+       FIFO capture is polled to avoid a board-level reset seen on watermark
+       edges at 80 kS/s. */
     gpio_config_t g = {
         .pin_bit_mask = (1ULL << IIS3DWB10IS_PIN_INT1),
         .mode = GPIO_MODE_INPUT,
@@ -348,8 +380,8 @@ esp_err_t iis3dwb10is_init(void)
     iis3dwb10is_write(REG_CTRL1, IIS3DWB10IS_ODR_IDLE);                       /* idle */
     iis3dwb10is_write(REG_FIFO_CTRL1, (uint8_t)(FIFO_WATERMARK & 0xFF));
     iis3dwb10is_write(REG_FIFO_CTRL2, (uint8_t)((FIFO_WATERMARK >> 8) & 0x0F));
-    iis3dwb10is_write(REG_INT_CTRL2, INT1_FIFO_TH);                           /* wtm → INT1 */
-    iis3dwb10is_write(REG_FIFO_CTRL3, 0x00);                                  /* bypass */
+    iis3dwb10is_write(REG_INT_CTRL2, 0x00);                                   /* FIFO is polled */
+    iis3dwb10is_write(REG_FIFO_CTRL3, FIFO_CTRL3_MODE_BYPASS);                 /* bypass */
 
     /* Readback self-check: catches a wrong write immediately at boot. */
     uint8_t c2 = iis3dwb10is_read(REG_CTRL2);

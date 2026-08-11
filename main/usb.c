@@ -16,6 +16,7 @@
 #include <math.h>
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "esp_timer.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
@@ -25,8 +26,8 @@
 static const char *TAG = "usb";
 
 static SemaphoreHandle_t s_tx_lock;
-/* Reliable default for the 8 MHz SPI link; 80 kS/s remains selectable. */
-static iis3dwb10is_odr_t s_odr = IIS3DWB10IS_ODR_40K;
+/* Validated lossless default: 80 kS/s captured to PSRAM, then dumped. */
+static iis3dwb10is_odr_t s_odr = IIS3DWB10IS_ODR_80K;
 static iis3dwb10is_fs_t  s_fs  = IIS3DWB10IS_FS_50G;
 static iis3dwb10is_bits_t s_bits = IIS3DWB10IS_BITS_20;
 
@@ -121,6 +122,7 @@ static void do_status(void)
                (unsigned long)capture_rows(), (int)capture_overrun(),
                iis3dwb10is_fs_to_mglsb_bits(s_fs, s_bits));
     usb_printf("STATUS output_bits=%u\n", (unsigned)s_bits);
+    usb_printf("STATUS spi_khz=%d\n", iis3dwb10is_spi_khz());
 }
 
 static void do_temperature(void)
@@ -376,16 +378,27 @@ static void do_probe(void)
     uint8_t direct[12] = { 0 };
     uint8_t row[FIFO_ROW_BYTES] = { 0 };
     iis3dwb10is_start(s_odr, s_fs);
-    vTaskDelay(pdMS_TO_TICKS(100));
+    const int64_t rate_start_us = esp_timer_get_time();
+    esp_rom_delay_us(10000);
+    uint16_t level_10ms = iis3dwb10is_fifo_level();
+    int64_t time_10ms = esp_timer_get_time() - rate_start_us;
+    esp_rom_delay_us(5000);
+    uint16_t level_15ms = iis3dwb10is_fifo_level();
+    int64_t time_15ms = esp_timer_get_time() - rate_start_us;
+    esp_rom_delay_us(5000);
+    uint16_t level_20ms = iis3dwb10is_fifo_level();
+    int64_t time_20ms = esp_timer_get_time() - rate_start_us;
     uint8_t ctrl1 = iis3dwb10is_read(REG_CTRL1);
     uint8_t ctrl2 = iis3dwb10is_read(REG_CTRL2);
     uint8_t ctrl3 = iis3dwb10is_read(REG_CTRL3);
     uint8_t ctrl4 = iis3dwb10is_read(REG_CTRL4);
+    uint8_t pll1 = iis3dwb10is_read(REG_PLL_CTRL1);
+    uint8_t pll2 = iis3dwb10is_read(REG_PLL_CTRL2);
     uint8_t int_ctrl1 = iis3dwb10is_read(0x0C);
     uint8_t int_ctrl2 = iis3dwb10is_read(REG_INT_CTRL2);
     uint8_t status = iis3dwb10is_read(REG_STATUS_REG);
     uint8_t fifo_ctrl3 = iis3dwb10is_read(REG_FIFO_CTRL3);
-    uint16_t level = iis3dwb10is_fifo_level();
+    uint16_t level = level_20ms;
     iis3dwb10is_read_burst(REG_OUTX_L_A, direct, sizeof(direct));
     if (iis3dwb10is_direct_mode()) {
         (void)iis3dwb10is_direct_read_row(row);
@@ -395,10 +408,18 @@ static void do_probe(void)
     iis3dwb10is_stop();
 
     usb_printf("PROBE regs ctrl1=%02X ctrl2=%02X ctrl3=%02X ctrl4=%02X "
+               "pll1=%02X pll2=%02X "
                "int1=%02X int2=%02X status=%02X int1_gpio=%d "
-               "fifo_ctrl3=%02X level=%u\n",
-               ctrl1, ctrl2, ctrl3, ctrl4, int_ctrl1, int_ctrl2, status,
-               gpio_get_level(IIS3DWB10IS_PIN_INT1), fifo_ctrl3, (unsigned)level);
+               "fifo_ctrl3=%02X level=%u rate10=%u@%lldus rate15=%u@%lldus "
+               "rate20=%u@%lldus steady_rate=%.1f\n",
+               ctrl1, ctrl2, ctrl3, ctrl4, pll1, pll2,
+               int_ctrl1, int_ctrl2, status,
+               gpio_get_level(IIS3DWB10IS_PIN_INT1), fifo_ctrl3, (unsigned)level,
+               (unsigned)level_10ms, time_10ms,
+               (unsigned)level_15ms, time_15ms,
+               (unsigned)level_20ms, time_20ms,
+               (double)(level_20ms - level_10ms) * 1000000.0 /
+               (double)(time_20ms - time_10ms));
     usb_printf("PROBE direct x=%ld y=%ld z=%ld raw="
                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
                (long)get_i32_le(&direct[0]), (long)get_i32_le(&direct[4]),

@@ -25,13 +25,19 @@ status. No CSV copy is produced. To open it again:
 python inspect_raw.py raw_capture.npz
 ```
 
-The capture default is 40,000 samples/s. The PCB's SPI link is reliable at
-8 MHz; 10 MHz and above corrupted FIFO reads during hardware testing. Because
-each 20-bit FIFO sample occupies 10 bytes, 80,000 samples/s leaves no practical
-bus margin at 8 MHz and is not suitable for lossless recording on this board.
-The saved `sample_rate_hz` is measured from the returned row count and the
-ESP32 capture duration, so cursor timing uses the observed rate rather than
-only the nominal ODR setting.
+The capture default is 80,000 samples/s. One hardware-CS SPI device handles
+both sensor configuration and FIFO reads with a requested 12 MHz clock; the
+ESP32-S3 divider produces an actual 11.428 MHz clock. The sensor's 10-byte FIFO
+rows are recorded to PSRAM in bulk and transferred over USB only after capture.
+A 10-second hardware test returned 799,234 valid rows at 79,867.5 samples/s
+with no FIFO overrun.
+
+High-rate capture polls and drains the 2048-row FIFO every RTOS tick instead
+of routing its watermark to INT1. Sustained watermark output caused this
+sensor/board to reset at 80,000 samples/s; polling avoided the reset and left
+enough CPU idle time for the watchdog. The saved `sample_rate_hz` is measured
+from the returned row count and ESP32 capture duration, so cursor timing uses
+the observed rate rather than only the nominal ODR setting.
 
 Use `--seconds` to request another duration. Before starting, the script checks
 the board's PSRAM capture capacity and refuses a duration that cannot fit:
