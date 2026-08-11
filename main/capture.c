@@ -40,7 +40,7 @@ static QueueHandle_t s_stream_ready;
 static int64_t s_store_start_us;
 static uint32_t s_store_dur_ms;
 static iis3dwb10is_odr_t s_last_odr = IIS3DWB10IS_ODR_80K;
-static iis3dwb10is_fs_t  s_last_fs  = IIS3DWB10IS_FS_50G;
+static iis3dwb10is_fs_t  s_last_fs  = IIS3DWB10IS_FS_200G;
 
 /* STREAM buffers stay in internal RAM for SPI DMA. */
 static uint8_t s_stream_buf[STREAM_BUFFERS][STREAM_ROWS * FIFO_ROW_BYTES];

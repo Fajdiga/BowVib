@@ -4,7 +4,7 @@
 Examples:
     python inspect_raw.py --port COM53
     python inspect_raw.py raw_capture.npz
-    python inspect_raw.py old_counts.npy --rate 80000 --fs 50
+    python inspect_raw.py old_counts.npy --rate 80000 --fs 200
     python inspect_raw.py --demo
 
 The plot has two draggable cursors. Their readout shows time, XYZ amplitude,
@@ -595,7 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rate", type=float, help="sample rate in Hz (capture default: 80000)"
     )
-    parser.add_argument("--fs", type=int, choices=(50, 100, 200), default=50)
+    parser.add_argument("--fs", type=int, choices=(50, 100, 200), default=200)
     parser.add_argument("--save", type=Path, help="capture output (default: raw_capture.npz)")
     parser.add_argument("--overwrite", action="store_true", help="replace capture output")
     parser.add_argument("--counts", action="store_true", help="display raw LSB counts")

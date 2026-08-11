@@ -28,7 +28,7 @@ static const char *TAG = "usb";
 static SemaphoreHandle_t s_tx_lock;
 /* Validated lossless default: 80 kS/s captured to PSRAM, then dumped. */
 static iis3dwb10is_odr_t s_odr = IIS3DWB10IS_ODR_80K;
-static iis3dwb10is_fs_t  s_fs  = IIS3DWB10IS_FS_50G;
+static iis3dwb10is_fs_t  s_fs  = IIS3DWB10IS_FS_200G;
 static iis3dwb10is_bits_t s_bits = IIS3DWB10IS_BITS_20;
 
 #define RAW_COMPARE_SAMPLES   100U
@@ -134,7 +134,7 @@ static void do_temperature(void)
 
     int32_t sum = 0;
     iis3dwb10is_set_output_bits(IIS3DWB10IS_BITS_20);
-    iis3dwb10is_start(IIS3DWB10IS_ODR_80K, IIS3DWB10IS_FS_50G);
+    iis3dwb10is_start(IIS3DWB10IS_ODR_80K, IIS3DWB10IS_FS_200G);
     vTaskDelay(pdMS_TO_TICKS(50));
     for (unsigned sample = 0; sample < 4U; ++sample) {
         int16_t raw = 0;
@@ -217,7 +217,7 @@ static bool prepare_direct(iis3dwb10is_bits_t bits, uint8_t *discard,
                            uint16_t bytes)
 {
     iis3dwb10is_set_output_bits(bits);
-    iis3dwb10is_start(IIS3DWB10IS_ODR_10K, IIS3DWB10IS_FS_50G);
+    iis3dwb10is_start(IIS3DWB10IS_ODR_10K, IIS3DWB10IS_FS_200G);
     vTaskDelay(pdMS_TO_TICKS(RAW_SETTLE_MS));
 
     /* Reading one complete settled value clears any stale XLDA/output value.
@@ -256,7 +256,7 @@ static bool raw_direct16(void)
     usb_printf("RAW direct16 bytes=%02X %02X|%02X %02X|%02X %02X "
                "sample=last\n", raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
     print_raw_average("direct16", sum,
-                      iis3dwb10is_fs_to_mglsb_bits(IIS3DWB10IS_FS_50G,
+                      iis3dwb10is_fs_to_mglsb_bits(IIS3DWB10IS_FS_200G,
                                                    IIS3DWB10IS_BITS_16));
     return true;
 }
@@ -290,7 +290,7 @@ static bool raw_direct20(void)
                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6],
                raw[7], raw[8], raw[9], raw[10], raw[11]);
     print_raw_average("direct20", sum,
-                      iis3dwb10is_fs_to_mglsb(IIS3DWB10IS_FS_50G));
+                      iis3dwb10is_fs_to_mglsb(IIS3DWB10IS_FS_200G));
     return true;
 }
 
@@ -300,7 +300,7 @@ static bool raw_fifo20(void)
     uint16_t startup_rows = 0;
     uint16_t level = 0;
     iis3dwb10is_set_output_bits(IIS3DWB10IS_BITS_20);
-    iis3dwb10is_start(IIS3DWB10IS_ODR_20K, IIS3DWB10IS_FS_50G);
+    iis3dwb10is_start(IIS3DWB10IS_ODR_20K, IIS3DWB10IS_FS_200G);
     vTaskDelay(pdMS_TO_TICKS(RAW_SETTLE_MS));
 
     if (iis3dwb10is_fifo_overrun()) {
@@ -336,11 +336,11 @@ static bool raw_fifo20(void)
                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6],
                raw[7], raw[8], raw[9], (unsigned)startup_rows, (unsigned)level);
     print_raw_average("fifo20", sum,
-                      iis3dwb10is_fs_to_mglsb(IIS3DWB10IS_FS_50G));
+                      iis3dwb10is_fs_to_mglsb(IIS3DWB10IS_FS_200G));
     return true;
 }
 
-/* Compare native layouts at a fixed +/-50 g. Each mode settles, discards old
+/* Compare native layouts at a fixed +/-200 g. Each mode settles, discards old
    output, and averages 100 fresh samples. Shell capture settings are preserved. */
 static void do_raw(const char *mode)
 {
@@ -358,7 +358,7 @@ static void do_raw(const char *mode)
         return;
     }
 
-    usb_printf("RAW BEGIN mode=%s fs=50 settle_ms=%u samples=%u\n", mode,
+    usb_printf("RAW BEGIN mode=%s fs=200 settle_ms=%u samples=%u\n", mode,
                RAW_SETTLE_MS, RAW_COMPARE_SAMPLES);
     if (all || !strcmp(mode, "DIRECT16")) raw_direct16();
     if (all || !strcmp(mode, "DIRECT20")) raw_direct20();

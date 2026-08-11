@@ -25,9 +25,10 @@ status. No CSV copy is produced. To open it again:
 python inspect_raw.py raw_capture.npz
 ```
 
-The capture default is 80,000 samples/s. One hardware-CS SPI device handles
-both sensor configuration and FIFO reads with a requested 12 MHz clock; the
-ESP32-S3 divider produces an actual 11.428 MHz clock. The sensor's 10-byte FIFO
+The capture defaults are 80,000 samples/s and a ±200 g full-scale range. One
+hardware-CS SPI device handles both sensor configuration and FIFO reads with a
+requested 12 MHz clock; the ESP32-S3 divider produces an actual 11.428 MHz
+clock. The sensor's 10-byte FIFO
 rows are recorded to PSRAM in bulk and transferred over USB only after capture.
 A 10-second hardware test returned 799,234 valid rows at 79,867.5 samples/s
 with no FIFO overrun.
@@ -51,7 +52,7 @@ files are treated as acceleration in g. Supply the correct rate when the file
 does not contain metadata:
 
 ```powershell
-python inspect_raw.py measurement.npy --rate 80000 --fs 50
+python inspect_raw.py measurement.npy --rate 80000 --fs 200
 ```
 
 The red and purple vertical lines are cursors A and B. Drag either line, then
