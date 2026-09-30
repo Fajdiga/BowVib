@@ -81,16 +81,17 @@ static void wifi_reply_status(void)
         pos += (size_t)n;
     }
     (void)snprintf(line, sizeof(line),
-                   "STATUS running=%d sensors=4 present_mask=%02X odr_hz=%u fs_g=%u freq_fine=%s\n",
+                   "STATUS running=%d sensors=4 present_mask=%02X odr_hz=%u fs_g=%u fifo=%s freq_fine=%s\n",
                    capture_running() ? 1 : 0, mask,
-                   LSM6DSV320X_ODR_HZ, LSM6DSV320X_FS_G, freq_fine);
+                   LSM6DSV320X_ODR_HZ, LSM6DSV320X_FS_G,
+                   capture_running() ? "streaming" : "idle", freq_fine);
     (void)wifi_stream_send_text(line);
 }
 
 static void handle_wifi_command_unlocked(char *line)
 {
     if (capture_running()) {
-        if (capture_wifi_active()) {
+        if (capture_wifi_active() && !capture_browser_active()) {
             if (!strcmp(line, "STOP")) capture_stop();
         } else if (!strcmp(line, "STATUS")) {
             wifi_reply_status();
@@ -150,7 +151,7 @@ static void handle_wifi_command(char *line)
 
 static void close_client(int client)
 {
-    const bool was_wifi_capture = capture_wifi_active();
+    const bool was_wifi_capture = capture_wifi_active() && !capture_browser_active();
     if (was_wifi_capture) capture_stop();
     xSemaphoreTake(s_socket_lock, portMAX_DELAY);
     if (s_client_socket == client) {

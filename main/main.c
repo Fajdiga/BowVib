@@ -5,6 +5,7 @@
 #include "capture.h"
 #include "usb.h"
 #include "wifi_stream.h"
+#include "web_capture.h"
 
 static const char *TAG = "bowvib";
 
@@ -26,6 +27,11 @@ void app_main(void)
     err = wifi_stream_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi AP/TCP init failed: %s", esp_err_to_name(err));
+    } else {
+        err = web_capture_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Browser capture server failed: %s", esp_err_to_name(err));
+        }
     }
     err = usb_start();
     if (err != ESP_OK) {

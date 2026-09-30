@@ -76,9 +76,10 @@ static void status(void)
         pos += (size_t)n;
     }
     usb_printf("STATUS running=%d sensors=4 present_mask=%02X present=%s whoami=%s "
-               "odr_hz=%u fs_g=%u fifo=on spi_hz=10000000 freq_fine=%s\n",
+               "odr_hz=%u fs_g=%u fifo=%s spi_hz=10000000 freq_fine=%s\n",
                capture_running() ? 1 : 0, mask, names, ids,
-               LSM6DSV320X_ODR_HZ, LSM6DSV320X_FS_G, freq_fine);
+               LSM6DSV320X_ODR_HZ, LSM6DSV320X_FS_G,
+               capture_running() ? "streaming" : "idle", freq_fine);
 }
 
 static void handle_line_unlocked(char *line)
@@ -167,6 +168,7 @@ static void usb_task(void *arg)
     if (wifi_stream_ready()) {
         usb_printf("Wi-Fi AP: %s password=%s TCP=192.168.4.1:%u\n",
                    BOWVIB_WIFI_SSID, BOWVIB_WIFI_PASSWORD, BOWVIB_WIFI_PORT);
+        usb_printf("Phone capture page: http://192.168.4.1/\n");
     } else {
         usb_printf("Wi-Fi AP startup failed\n");
     }

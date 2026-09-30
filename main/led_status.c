@@ -3,6 +3,7 @@
 #include "capture.h"
 #include "lsm6dsv320x.h"
 #include "wifi_stream.h"
+#include "web_capture.h"
 
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
@@ -52,7 +53,7 @@ static void led_status_task(void *arg)
     for (;;) {
         const uint8_t present = lsm6dsv320x_present_mask();
         const bool wifi_ready = wifi_stream_ready();
-        const bool client = wifi_stream_client_connected();
+        const bool client = wifi_stream_client_connected() || web_capture_client_connected();
         const bool wifi_capture = capture_wifi_active();
         const bool capture = capture_running();
         const uint8_t overruns = capture_overrun_mask();

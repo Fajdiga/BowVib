@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BowVib capture</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#10151c;color:#e8edf3;font:16px system-ui,sans-serif}
+main{max-width:760px;margin:5vh auto;padding:20px}section{background:#171e28;border:1px solid #303b49;border-radius:14px;padding:24px}
+h1{font-size:1.6rem;margin:0 0 12px}p{color:#b6c5d6;line-height:1.5}#status{white-space:pre-wrap;line-height:1.6;min-height:100px;margin:20px 0}
+button{width:100%;background:#16834b;color:white;border:0;border-radius:8px;padding:16px;font-size:1rem;font-weight:700;cursor:pointer;margin:6px 0}
+button.secondary{background:#344354}button:disabled{opacity:.45;cursor:default}.hint{font-size:.9rem;color:#9baabc}
+canvas{display:block;width:100%;height:auto;margin-top:20px;border-radius:8px}canvas[hidden]{display:none}progress{width:100%;height:10px;accent-color:#22b86b}
+</style></head><body><main><section>
+<h1>BowVib capture</h1><p>Record all detected sensors directly over Wi-Fi.</p>
+<div id="status" role="status" aria-live="polite">Connecting to BowVib...</div>
+<progress id="progress" max="10" value="0" aria-label="Capture progress"></progress>
+<button id="record" disabled>Start 10-second capture</button>
+<button id="download" class="secondary" disabled>Save capture to this device</button>
+<button id="plot" class="secondary" disabled>Plot capture</button>
+<button id="savePlot" class="secondary" disabled>Save plot as PNG</button>
+<canvas id="chart" width="1200" height="1080" hidden></canvas>
+<p class="hint">Keep this page open and your screen awake during capture. The recording stays in this browser until you save it or record again. No PC or internet connection is needed.</p>
+</section></main><script src="/format.js"></script><script src="/capture.js"></script></body></html>

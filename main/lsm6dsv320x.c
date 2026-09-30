@@ -129,11 +129,11 @@ static esp_err_t setup_imu(unsigned imu)
     err = write_reg(imu, REG_CTRL1_XL_HG, 0x3CU);
     if (err != ESP_OK) return err;
 
-    /* Continuous mode lets firmware drain the FIFO while acquisition runs. */
+    /* Keep the FIFO bypassed while idle; capture_start enables batching. */
     uint8_t fine;
     s_freq_fine[imu] = read_reg(imu, REG_INTERNAL_FREQ_FINE, &fine) == ESP_OK ?
                        (int8_t)fine : INT8_MIN;
-    return write_reg(imu, REG_FIFO_CTRL4, FIFO_MODE_CONTINUOUS);
+    return ESP_OK;
 }
 
 esp_err_t lsm6dsv320x_init(void)
@@ -279,6 +279,10 @@ void lsm6dsv320x_capture_start(void)
     for (unsigned i = 0; i < LSM6DSV320X_COUNT; ++i) {
         if (!(s_present_mask & (1U << i))) continue;
         (void)write_reg(i, REG_FIFO_CTRL4, FIFO_MODE_BYPASS);
+        /* FIFO_OVR_LATCHED clears on read. Discard only the previous capture's
+           status while batching is disabled, before any new samples enter. */
+        uint8_t status[2];
+        (void)read_burst(i, REG_FIFO_STATUS1, status, sizeof(status));
         (void)write_reg(i, REG_CTRL1, 0x03U);
         (void)write_reg(i, REG_CTRL1_XL_HG, 0x3CU);
     }

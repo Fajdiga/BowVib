@@ -2,6 +2,7 @@
 #include "lsm6dsv320x.h"
 #include "usb.h"
 #include "wifi_stream.h"
+#include "web_capture.h"
 
 #include <string.h>
 #include "esp_timer.h"
@@ -15,13 +16,15 @@
 #define SAMPLE_BYTES 6U
 #define FRAME_HEADER_BYTES 7U
 #define WIFI_TX_BUFFER_BYTES (32U * 1024U)
-/* Share the 1 kHz time slice with USB/TCP command tasks; higher priority would
-   starve STOP/STATUS handling while the sensor FIFOs remain non-empty. */
-#define CAPTURE_TASK_PRIORITY (tskIDLE_PRIORITY + 5U)
+/* Stay ahead of HTTP/TCP sends while draining; the 1 ms delay below gives
+   command and network tasks regular time to run. */
+#define CAPTURE_TASK_PRIORITY (tskIDLE_PRIORITY + 6U)
 
 static volatile bool s_running;
 static volatile bool s_stop_requested;
 static volatile bool s_wifi_output;
+static volatile bool s_browser_output;
+static int64_t s_duration_limit_us;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_control_lock;
 static TaskHandle_t s_wifi_tx_task;
@@ -66,10 +69,13 @@ static void wifi_tx_task(void *arg)
     (void)arg;
     uint8_t data[2048];
     for (;;) {
+        /* Coalesce the 1 ms FIFO polls into fewer, larger network writes. */
         const size_t len = xStreamBufferReceive(s_wifi_tx_buffer, data,
-                                                sizeof(data), portMAX_DELAY);
+                                                sizeof(data), pdMS_TO_TICKS(5));
         if (len == 0U) continue;
-        if (!wifi_stream_send(data, len)) {
+        const bool sent = s_browser_output ? web_capture_send(data, len) :
+                                            wifi_stream_send(data, len);
+        if (!sent) {
             s_overrun_mask |= 0x80U;
             s_stop_requested = true;
         }
@@ -123,6 +129,7 @@ static void send_end_frame(void)
         vTaskDelay(1);
     }
     s_wifi_output = false;
+    s_browser_output = false;
 }
 
 static void capture_task(void *arg)
@@ -132,6 +139,10 @@ static void capture_task(void *arg)
         if (!s_running) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
+        }
+        if (s_duration_limit_us > 0 &&
+            esp_timer_get_time() - s_started_us >= s_duration_limit_us) {
+            s_stop_requested = true;
         }
         for (unsigned imu = 0; imu < LSM6DSV320X_COUNT; ++imu) {
             if (!(lsm6dsv320x_present_mask() & (1U << imu))) continue;
@@ -207,6 +218,8 @@ bool capture_start(void)
 {
     if (!s_task || s_running || lsm6dsv320x_present_mask() == 0U) return false;
     s_wifi_output = false;
+    s_browser_output = false;
+    s_duration_limit_us = 0;
     memset(s_counts, 0, sizeof(s_counts));
     s_overrun_mask = 0;
     s_stop_requested = false;
@@ -222,10 +235,29 @@ bool capture_start_wifi(void)
     if (!s_task || s_running || lsm6dsv320x_present_mask() == 0U ||
         !wifi_stream_client_connected()) return false;
     s_wifi_output = true;
+    s_browser_output = false;
+    s_duration_limit_us = 0;
     memset(s_counts, 0, sizeof(s_counts));
     s_overrun_mask = 0;
     /* The previous capture waited for TX completion; no reset of a stream
        buffer with a blocked reader is needed. */
+    s_stop_requested = false;
+    lsm6dsv320x_capture_start();
+    s_started_us = esp_timer_get_time();
+    s_running = true;
+    xTaskNotifyGive(s_task);
+    return true;
+}
+
+bool capture_start_browser(void)
+{
+    if (!s_task || s_running || lsm6dsv320x_present_mask() == 0U ||
+        !web_capture_client_connected()) return false;
+    s_wifi_output = true;
+    s_browser_output = true;
+    s_duration_limit_us = 10 * 1000 * 1000;
+    memset(s_counts, 0, sizeof(s_counts));
+    s_overrun_mask = 0;
     s_stop_requested = false;
     lsm6dsv320x_capture_start();
     s_started_us = esp_timer_get_time();
@@ -252,4 +284,9 @@ bool capture_wifi_active(void)
 uint8_t capture_overrun_mask(void)
 {
     return s_overrun_mask;
+}
+
+bool capture_browser_active(void)
+{
+    return s_running && s_browser_output;
 }

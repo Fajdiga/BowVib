@@ -1,6 +1,6 @@
 # BowVib: four LSM6DSV320X vibration channels
 
-ESP-IDF firmware for an ESP32-C6-MINI-1-H8 and four LSM6DSV320X IMUs. The firmware enables each IMU's high-g accelerometer at its maximum 7,680 samples/s and +/-320 g range. Each IMU writes to its own FIFO; the C6 polls and drains those FIFOs in order 1, 2, 3, 4 over one shared SPI bus. FIFO samples are sent to the host live over USB Serial/JTAG.
+ESP-IDF firmware for an ESP32-C6-MINI-1-H8 and four LSM6DSV320X IMUs. The firmware enables each IMU's high-g accelerometer at its maximum 7,680 samples/s and +/-320 g range. Each IMU writes to its own FIFO; the C6 polls and drains those FIFOs in order 1, 2, 3, 4 over one shared SPI bus. Samples stream live over USB Serial/JTAG, raw TCP, or directly to a phone browser over Wi-Fi.
 
 The H8 module provides 8 MB flash and no PSRAM. Wi-Fi capture uses a 32 KiB FreeRTOS stream buffer and a separate transmit task so brief network stalls do not block FIFO draining. This is a short-term queue, not an on-board recording buffer; sustained Wi-Fi throughput still needs to keep up with the four live channels. Four channels produce 30,720 XYZ samples/s total, or 184,320 payload bytes/s before frame headers. The host utilities decode signed 16-bit counts into `int32` arrays and store them in compressed `.npz` archives for offline analysis.
 
@@ -42,13 +42,30 @@ python board_control.py COM92 STATUS
 python inspect_raw.py --port COM92 --seconds 10 --save raw_capture.npz
 ```
 
-## Wi-Fi capture to a PC
+## Wi-Fi capture
 
-The ESP32-C6 starts a local WPA2 access point and TCP capture server:
+The ESP32-C6 starts a local WPA2 access point, a browser page, and a TCP capture server:
 
 - SSID: `BowVib-IMU`
 - Password: `BowVib320x`
-- TCP: `192.168.4.1:3333`
+- Phone/PC browser page: `http://192.168.4.1/` (port 80)
+- Raw TCP stream for Python receivers: `192.168.4.1:3333`
+
+### Direct phone capture (no PC needed)
+
+1. Power the board. USB can provide power; no USB data connection is needed.
+2. Connect the phone to `BowVib-IMU` with password `BowVib320x`. Stay connected if the phone warns that this network has no internet.
+3. Open **http://192.168.4.1/** in the phone browser. Use `http`, not `https`, and omit `:3333`.
+4. Press **Start 10-second capture**. Keep the page visible and the screen awake until it finishes.
+5. Press **Save capture to this device** to download the `.npz` file. **Plot capture** shows XYZ; **Save plot as PNG** saves the image.
+
+The ESP32 serves the complete page and streams binary samples over a WebSocket. It stops acquisition automatically after ten seconds, even if the browser timer is delayed. The phone holds the recording in memory and creates the archive locally. Save it before refreshing the page, closing the tab, or starting another capture. Only one browser can hold the capture connection at a time; close other capture tabs if the page keeps reconnecting. A disconnected capture is stopped and discarded.
+
+The phone page validates frame/footer counts and refuses to save captures with an overrun/transport error. Phone archives retain little-endian signed `int16` channels in an uncompressed NPZ ZIP; Python archives use `int32` channels and compression. Both open in `inspect_raw.py` and preserve full channel counts. The phone archive omits the redundant common-length `samples_lsb` array; the inspector constructs it on load.
+
+Port 3333 carries the raw command/binary protocol and cannot display an HTTP webpage.
+
+### Python receiver over Wi-Fi
 
 Connect the PC to that Wi-Fi network, then run the receiver over TCP:
 
@@ -75,7 +92,7 @@ Both the CLI and browser downloads contain four full XYZ count arrays (`imu1_sam
 
 For older browser archives that contain only individual IMU arrays, the inspector constructs the common-length view on load. Files without sample-rate metadata default to 7,680 Hz; specify `--rate 80000 --fs 200` when opening legacy 80 kHz / 200 g recordings.
 
-## Button-triggered 10-second capture
+## PC-hosted capture page (optional)
 
 Run the capture page over USB:
 
@@ -119,9 +136,9 @@ The active-high board LEDs on GPIO3-5 briefly sweep at boot, then report status:
 | --- | --- | --- |
 | LED1 / GPIO3 | Firmware alive | Steady on after startup. |
 | LED2 / GPIO4 | IMU discovery | Solid = all four found; slow blink = 1-3 found; fast blink = none found. |
-| LED3 / GPIO5 | Wi-Fi / capture | Off = AP failed; short pulse every 2 s = waiting for PC; solid = client connected and idle; fast blink = Wi-Fi capture; 1 Hz blink = USB capture; double flash every 3 s = overrun reported. |
+| LED3 / GPIO5 | Wi-Fi / capture | Off = AP failed; short pulse every 2 s = waiting for a capture client; solid = client connected and idle; fast blink = Wi-Fi capture; 1 Hz blink = USB capture; double flash every 3 s = overrun reported. |
 
-Use `python board_control.py COM92 LEDTEST` to flash each LED individually. The phone is a second Wi-Fi station; the PC remains the single stream client.
+Use `python board_control.py COM92 LEDTEST` to flash each LED individually. The access point accepts two Wi-Fi stations; either a phone browser or a PC receiver can own a capture.
 
 ## Project files
 
@@ -130,6 +147,7 @@ Use `python board_control.py COM92 LEDTEST` to flash each LED individually. The 
 | `main/lsm6dsv320x.c` | SPI discovery, IMU configuration, FIFO reads, and CS_A diagnostics. |
 | `main/capture.c` | FIFO polling, framing, counters, stop/tail handling, and Wi-Fi transmit queue. |
 | `main/usb.c`, `main/wifi_stream.c` | Command handlers and USB/TCP transports. |
+| `main/web_capture.c`, `main/web/` | Board-hosted phone page, WebSocket capture, plotting, and local NPZ downloads. |
 | `main/led_status.c` | Startup sequence and status indications. |
 | `inspect_raw.py` | Shared frame validation, archive handling, CLI capture, and offline plots. |
 | `capture_button.py` | Local HTTP page for repeated ten-second captures and downloads. |
@@ -157,4 +175,4 @@ python inspect_raw.py --port COM92 --seconds 10 --save usb_test.npz --plot-png u
 python inspect_raw.py usb_test.npz --no-gui
 ```
 
-Check that all expected sensors appear, frame counts match the footer, the status mask is zero, and each measured rate is close to its trim-predicted rate. Then run `capture_button.py`, capture twice, download both archives, and reopen them with `inspect_raw.py` to check repeated captures and storage.
+Check that all expected sensors appear, frame counts match the footer, the status mask is zero, and each measured rate is close to its trim-predicted rate. For standalone Wi-Fi validation, close USB receivers, connect directly to `BowVib-IMU`, open `http://192.168.4.1/`, capture twice, and save both archives. Reopen them with `inspect_raw.py` to check repeated captures and storage. The optional PC-hosted page can be checked the same way with `capture_button.py`.

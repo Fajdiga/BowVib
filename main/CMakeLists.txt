@@ -6,6 +6,7 @@ idf_component_register(
         "led_status.c"
         "usb.c"
         "wifi_stream.c"
+        "web_capture.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -13,10 +14,15 @@ idf_component_register(
         esp_driver_spi
         esp_driver_usb_serial_jtag
         esp_event
+        esp_http_server
         esp_netif
         esp_timer
         esp_wifi
         freertos
         lwip
         nvs_flash
+    EMBED_TXTFILES
+        "web/index.html"
+        "web/format.js"
+        "web/capture.js"
 )
