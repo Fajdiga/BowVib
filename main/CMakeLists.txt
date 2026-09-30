@@ -1,9 +1,22 @@
 idf_component_register(
     SRCS
         "main.c"
-        "iis3dwb10is.c"
+        "lsm6dsv320x.c"
         "capture.c"
+        "led_status.c"
         "usb.c"
+        "wifi_stream.c"
     INCLUDE_DIRS
         "."
+    REQUIRES
+        esp_driver_gpio
+        esp_driver_spi
+        esp_driver_usb_serial_jtag
+        esp_event
+        esp_netif
+        esp_timer
+        esp_wifi
+        freertos
+        lwip
+        nvs_flash
 )

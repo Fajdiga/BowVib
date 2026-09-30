@@ -1,425 +1,255 @@
-/*
- * capture.c — PSRAM capture engine for IIS3DWB10IS.
- */
 #include "capture.h"
+#include "lsm6dsv320x.h"
 #include "usb.h"
+#include "wifi_stream.h"
 
 #include <string.h>
-#include "esp_log.h"
-#include "esp_psram.h"
-#include "esp_heap_caps.h"
-#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
+#include "freertos/stream_buffer.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
-static const char *TAG = "capture";
+#define CHUNK_ROWS LSM6DSV320X_FIFO_ROWS_PER_READ
+#define WORD_BYTES LSM6DSV320X_FIFO_WORD_BYTES
+#define SAMPLE_BYTES 6U
+#define FRAME_HEADER_BYTES 7U
+#define WIFI_TX_BUFFER_BYTES (32U * 1024U)
+/* Share the 1 kHz time slice with USB/TCP command tasks; higher priority would
+   starve STOP/STATUS handling while the sensor FIFOs remain non-empty. */
+#define CAPTURE_TASK_PRIORITY (tskIDLE_PRIORITY + 5U)
 
-/* Up to this many bytes of PSRAM are used for the STORE buffer. Tunable. */
-#define CAP_MAX_BYTES   (8u * 1024u * 1024u)
-#define STREAM_ROWS     400u          /* rows per STREAM chunk (4000 bytes) */
-#define STREAM_BUFFERS  3u            /* overlap SPI reads with USB writes */
-#define STORE_DRAIN_LOW (FIFO_WATERMARK / 2u)
-
-typedef enum { CAP_IDLE, CAP_STORE, CAP_STREAM } cap_mode_t;
-
-static uint8_t  *s_buf;               /* PSRAM STORE buffer */
-static uint32_t  s_cap_bytes;         /* capacity, bytes */
-static uint32_t  s_write_idx;         /* valid bytes */
-static uint32_t  s_rows;
-static uint32_t  s_psram_size;
-static bool      s_overrun;
-
-static volatile cap_mode_t s_mode = CAP_IDLE;
-static volatile bool       s_stop_req = false;
+static volatile bool s_running;
+static volatile bool s_stop_requested;
+static volatile bool s_wifi_output;
 static TaskHandle_t s_task;
-static QueueHandle_t s_stream_free;
-static QueueHandle_t s_stream_ready;
+static SemaphoreHandle_t s_control_lock;
+static TaskHandle_t s_wifi_tx_task;
+static StreamBufferHandle_t s_wifi_tx_buffer;
+static StaticStreamBuffer_t s_wifi_tx_buffer_control;
+static uint8_t s_wifi_tx_storage[WIFI_TX_BUFFER_BYTES];
+static volatile uint32_t s_wifi_enqueued_bytes;
+static volatile uint32_t s_wifi_completed_bytes;
+static uint32_t s_counts[LSM6DSV320X_COUNT];
+static volatile uint8_t s_overrun_mask;
+static int64_t s_started_us;
+static uint8_t s_fifo_raw[CHUNK_ROWS * WORD_BYTES];
+static uint8_t s_frame[FRAME_HEADER_BYTES + CHUNK_ROWS * SAMPLE_BYTES];
 
-static int64_t s_store_start_us;
-static uint32_t s_store_dur_ms;
-static iis3dwb10is_odr_t s_last_odr = IIS3DWB10IS_ODR_80K;
-static iis3dwb10is_fs_t  s_last_fs  = IIS3DWB10IS_FS_200G;
-
-/* STREAM buffers stay in internal RAM for SPI DMA. */
-static uint8_t s_stream_buf[STREAM_BUFFERS][STREAM_ROWS * FIFO_ROW_BYTES];
-static bool     s_direct_stream_active;
-static uint8_t  s_direct_stream_index;
-static uint16_t s_direct_stream_rows;
-
-typedef struct {
-    uint8_t  index;
-    uint16_t rows;
-} stream_block_t;
-
-static uint32_t odr_to_hz(iis3dwb10is_odr_t odr)
+static bool capture_send(const void *data, size_t len, TickType_t wait)
 {
-    switch (odr) {
-    case IIS3DWB10IS_ODR_2P5K: return 2500U;
-    case IIS3DWB10IS_ODR_5K:   return 5000U;
-    case IIS3DWB10IS_ODR_10K:  return 10000U;
-    case IIS3DWB10IS_ODR_20K:  return 20000U;
-    case IIS3DWB10IS_ODR_40K:  return 40000U;
-    case IIS3DWB10IS_ODR_80K:  return 80000U;
-    default:                   return 0U;
-    }
-}
-
-static uint16_t fs_to_g(iis3dwb10is_fs_t fs)
-{
-    return fs == IIS3DWB10IS_FS_50G ? 50U :
-           fs == IIS3DWB10IS_FS_100G ? 100U : 200U;
-}
-
-/* ---- accessors --------------------------------------------------------- */
-uint8_t  *capture_buf(void)        { return s_buf; }
-uint32_t  capture_bytes(void)      { return s_write_idx; }
-uint32_t  capture_rows(void)       { return s_rows; }
-uint32_t  capture_capacity(void)   { return s_cap_bytes; }
-bool      capture_overrun(void)    { return s_overrun; }
-uint32_t  capture_duration_ms(void){ return s_store_dur_ms; }
-iis3dwb10is_odr_t capture_last_odr(void)   { return s_last_odr; }
-iis3dwb10is_fs_t  capture_last_fs(void)    { return s_last_fs; }
-uint32_t  capture_psram_size(void) { return s_psram_size; }
-bool      capture_running(void)    { return s_mode != CAP_IDLE; }
-
-/* ---- INT1 → task (IRAM) ------------------------------------------------ */
-static void IRAM_ATTR on_int1(void *arg)
-{
-    (void)arg;
-    BaseType_t hpw = pdFALSE;
-    vTaskNotifyGiveFromISR(s_task, &hpw);   /* counting notify: consumed by task */
-    portYIELD_FROM_ISR(hpw);
-}
-
-/* ---- task -------------------------------------------------------------- */
-static void finish_store(bool full)
-{
-    s_store_dur_ms = (uint32_t)((esp_timer_get_time() - s_store_start_us) / 1000);
-    iis3dwb10is_stop();
-    s_mode = CAP_IDLE;
-    usb_printf("CAPTURE %s rows=%lu bytes=%lu overrun=%d "
-               "odr_hz=%lu fs_g=%u dur_ms=%lu\n",
-               full ? "DONE" : "STOPPED",
-               (unsigned long)s_rows, (unsigned long)s_write_idx,
-               (int)s_overrun, (unsigned long)odr_to_hz(s_last_odr),
-               (unsigned)fs_to_g(s_last_fs),
-               (unsigned long)s_store_dur_ms);
-}
-
-static void stream_tx_task(void *arg)
-{
-    (void)arg;
-    stream_block_t block;
-    while (1) {
-        if (xQueueReceive(s_stream_ready, &block, portMAX_DELAY) == pdTRUE) {
-            usb_send(s_stream_buf[block.index],
-                     (size_t)block.rows * FIFO_ROW_BYTES);
-            xQueueSend(s_stream_free, &block.index, portMAX_DELAY);
-        }
-    }
-}
-
-static bool direct_store_sample(void)
-{
-    if (s_write_idx + FIFO_ROW_BYTES > s_cap_bytes) {
-        return false;
-    }
-    uint8_t row[FIFO_ROW_BYTES];
-    if (!iis3dwb10is_direct_read_row(row)) {
-        s_overrun = true;
-        return false;
-    }
-    memcpy(s_buf + s_write_idx, row, FIFO_ROW_BYTES);
-    s_write_idx += FIFO_ROW_BYTES;
-    s_rows++;
-    return true;
-}
-
-static bool direct_stream_sample(void)
-{
-    if (!s_direct_stream_active) {
-        if (xQueueReceive(s_stream_free, &s_direct_stream_index,
-                          pdMS_TO_TICKS(1)) != pdTRUE) {
-            s_overrun = true;
+    if (s_wifi_output) {
+        if (len > FRAME_HEADER_BYTES + CHUNK_ROWS * SAMPLE_BYTES) return false;
+        if (wait == 0 && xStreamBufferSpacesAvailable(s_wifi_tx_buffer) < len) {
+            s_overrun_mask |= 0x80U; /* RAM-to-Wi-Fi queue overflow */
+            s_stop_requested = true;
             return false;
         }
-        s_direct_stream_rows = 0;
-        s_direct_stream_active = true;
-    }
-    uint8_t *dst = s_stream_buf[s_direct_stream_index] +
-                   (size_t)s_direct_stream_rows * FIFO_ROW_BYTES;
-    if (!iis3dwb10is_direct_read_row(dst)) {
-        s_overrun = true;
-        return false;
-    }
-    s_direct_stream_rows++;
-    if (s_direct_stream_rows == STREAM_ROWS) {
-        stream_block_t block = {
-            .index = s_direct_stream_index,
-            .rows = s_direct_stream_rows,
-        };
-        if (xQueueSend(s_stream_ready, &block, 0) != pdTRUE) {
-            xQueueSend(s_stream_free, &s_direct_stream_index, portMAX_DELAY);
-            s_overrun = true;
+        if (xStreamBufferSend(s_wifi_tx_buffer, data, len, wait) != len) {
+            s_overrun_mask |= 0x80U; /* RAM-to-Wi-Fi queue overflow */
+            s_stop_requested = true;
+            return false;
         }
-        s_direct_stream_active = false;
-        s_direct_stream_rows = 0;
+        s_wifi_enqueued_bytes += len;
+    } else {
+        if (!usb_send(data, len)) {
+            s_overrun_mask |= 0x80U; /* Output transport failure. */
+            s_stop_requested = true;
+            return false;
+        }
     }
     return true;
 }
 
-/* INT1 is the preferred wake source.  If the board's INT1 trace is not
-   populated, XLDA polling keeps the direct path functional instead of
-   freezing at zero samples.  The status bit is checked immediately before
-   each DMA read, so this does not duplicate samples. */
-static void direct_poll_fallback(bool stream)
+static void wifi_tx_task(void *arg)
 {
-    const int64_t deadline = esp_timer_get_time() + 10000; /* 10 ms */
-    while (!s_stop_req && iis3dwb10is_direct_mode() &&
-           esp_timer_get_time() < deadline) {
-        if (iis3dwb10is_data_ready()) {
-            if (stream ? !direct_stream_sample() : !direct_store_sample()) {
-                break;
-            }
-        } else {
-            esp_rom_delay_us(2);
+    (void)arg;
+    uint8_t data[2048];
+    for (;;) {
+        const size_t len = xStreamBufferReceive(s_wifi_tx_buffer, data,
+                                                sizeof(data), portMAX_DELAY);
+        if (len == 0U) continue;
+        if (!wifi_stream_send(data, len)) {
+            s_overrun_mask |= 0x80U;
+            s_stop_requested = true;
         }
+        s_wifi_completed_bytes += len;
     }
+}
+
+static void send_data_frame(unsigned imu, const uint8_t *fifo, uint16_t rows)
+{
+    uint16_t kept = 0;
+    s_frame[0] = 'I'; s_frame[1] = 'M'; s_frame[2] = '4'; s_frame[3] = 'D';
+    s_frame[4] = (uint8_t)imu;
+    for (uint16_t row = 0; row < rows; ++row) {
+        const uint8_t *src = fifo + (size_t)row * WORD_BYTES;
+        if ((src[0] & 0xF8U) != (0x1DU << 3)) {
+            continue;
+        }
+        memcpy(s_frame + FRAME_HEADER_BYTES + (size_t)kept * SAMPLE_BYTES,
+               src + 1, SAMPLE_BYTES);
+        ++kept;
+    }
+    if (kept == 0) return;
+    s_frame[5] = (uint8_t)(kept & 0xFFU);
+    s_frame[6] = (uint8_t)(kept >> 8);
+    const size_t frame_len = FRAME_HEADER_BYTES + (size_t)kept * SAMPLE_BYTES;
+    if (!capture_send(s_frame, frame_len, 0)) return;
+    s_counts[imu] += kept;
+}
+
+static void send_end_frame(void)
+{
+    uint8_t end[4U + LSM6DSV320X_COUNT * 4U + 4U + 1U];
+    const uint32_t duration_ms = (uint32_t)((esp_timer_get_time() - s_started_us) / 1000);
+    memcpy(end, "IM4E", 4);
+    for (unsigned i = 0; i < LSM6DSV320X_COUNT; ++i) {
+        const uint32_t n = s_counts[i];
+        end[4U + i * 4U] = (uint8_t)n;
+        end[5U + i * 4U] = (uint8_t)(n >> 8);
+        end[6U + i * 4U] = (uint8_t)(n >> 16);
+        end[7U + i * 4U] = (uint8_t)(n >> 24);
+    }
+    const unsigned off = 4U + LSM6DSV320X_COUNT * 4U;
+    end[off] = (uint8_t)duration_ms;
+    end[off + 1U] = (uint8_t)(duration_ms >> 8);
+    end[off + 2U] = (uint8_t)(duration_ms >> 16);
+    end[off + 3U] = (uint8_t)(duration_ms >> 24);
+    end[off + 4U] = s_overrun_mask;
+    (void)capture_send(end, sizeof(end), portMAX_DELAY);
+    /* Keep capture busy until the queued footer has passed through TX. */
+    while (s_wifi_output && s_wifi_completed_bytes != s_wifi_enqueued_bytes) {
+        vTaskDelay(1);
+    }
+    s_wifi_output = false;
 }
 
 static void capture_task(void *arg)
 {
     (void)arg;
-    while (1) {
-        /* Block until INT1 (or a stop/timeout while running). */
-        if (s_mode == CAP_IDLE) {
+    for (;;) {
+        if (!s_running) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
-
-        /* CONFIG_FREERTOS_HZ is 100, so a nominal 5 ms conversion is zero
-           ticks and would busy-loop, starving IDLE1 and its watchdog. One
-           tick gives IDLE1 10 ms while the sensor FIFO absorbs ~800 rows. */
-        TickType_t wait_ticks = pdMS_TO_TICKS(10);
-        uint32_t events = ulTaskNotifyTake(pdTRUE, wait_ticks);
-        const bool got_events = events != 0;
-
-        if (s_mode == CAP_STORE) {
-            if (iis3dwb10is_direct_mode()) {
-                /* One INT1 event corresponds to one fresh direct-register
-                   sample.  The SPI transaction itself is queued to the DMA
-                   engine; no FIFO status polling is involved. */
-                while (events-- && !s_stop_req) {
-                    if (!direct_store_sample()) {
-                        break;
-                    }
-                }
-                if (!got_events && !s_stop_req) {
-                    direct_poll_fallback(false);
-                }
-            } else {
-                /* FIFO interrupts are deliberately disabled because sustained
-                   watermark edges reset this sensor/board at 80 kS/s. Poll at
-                   one RTOS tick and drain below half the watermark. */
-                uint16_t lvl = iis3dwb10is_fifo_level();
-                while (lvl) {
-                    uint32_t free_rows = (s_cap_bytes - s_write_idx) / FIFO_ROW_BYTES;
-                    uint16_t n = (lvl > free_rows) ? (uint16_t)free_rows : lvl;
-                    if (!n) {
-                        break;
-                    }
-                    iis3dwb10is_fifo_read(s_buf + s_write_idx, n);
-                    s_write_idx += (uint32_t)n * FIFO_ROW_BYTES;
-                    s_rows += n;
-                    if (iis3dwb10is_fifo_overrun()) {
-                        s_overrun = true;
-                    }
-                    if (s_stop_req ||
-                        s_write_idx + FIFO_ROW_BYTES > s_cap_bytes) {
-                        break;
-                    }
-                    lvl = iis3dwb10is_fifo_level();
-                    if (lvl < STORE_DRAIN_LOW) {
-                        break;
-                    }
-                }
+        for (unsigned imu = 0; imu < LSM6DSV320X_COUNT; ++imu) {
+            if (!(lsm6dsv320x_present_mask() & (1U << imu))) continue;
+            uint16_t level = lsm6dsv320x_fifo_level(imu);
+            if (lsm6dsv320x_fifo_overrun(imu)) {
+                s_overrun_mask |= (uint8_t)(1U << imu);
             }
-            if (s_stop_req || s_write_idx + FIFO_ROW_BYTES > s_cap_bytes) {
-                finish_store(!s_stop_req);
-                s_stop_req = false;
-            }
-        } else if (s_mode == CAP_STREAM) {
-            if (iis3dwb10is_direct_mode()) {
-                /* Keep a partially-filled USB block across interrupt wakeups
-                   so the host receives efficient bursts instead of one USB
-                   write per sample. */
-                while (events-- && !s_stop_req) {
-                    if (!direct_stream_sample()) {
-                        break;
-                    }
+            while (level && !s_stop_requested) {
+                const uint16_t n = level > CHUNK_ROWS ? CHUNK_ROWS : level;
+                if (lsm6dsv320x_fifo_read(imu, s_fifo_raw, n) != ESP_OK) {
+                    s_overrun_mask |= (uint8_t)(1U << imu);
+                    break;
                 }
-                if (!got_events && !s_stop_req) {
-                    direct_poll_fallback(true);
-                }
-            } else {
-                /* FIFO mode: once woken, keep draining all rows currently
-                   available.  High ODRs therefore use DMA bulk reads and do
-                   not require one interrupt or USB write per sample. */
-                while (!s_stop_req) {
-                    uint16_t lvl = iis3dwb10is_fifo_level();
-                    uint16_t n = (lvl > STREAM_ROWS) ? STREAM_ROWS : lvl;
-                    if (!n) {
-                        break;
-                    }
-                    uint8_t index;
-                    if (xQueueReceive(s_stream_free, &index,
-                                      pdMS_TO_TICKS(1)) != pdTRUE) {
-                        if (iis3dwb10is_fifo_overrun()) {
-                            s_overrun = true;
-                        }
-                        continue;
-                    }
-                    iis3dwb10is_fifo_read(s_stream_buf[index], n);
-                    stream_block_t block = { .index = index, .rows = n };
-                    if (xQueueSend(s_stream_ready, &block, 0) != pdTRUE) {
-                        /* Should be unreachable: ready and free have equal depth. */
-                        xQueueSend(s_stream_free, &index, portMAX_DELAY);
-                        s_overrun = true;
-                    }
-                    if (iis3dwb10is_fifo_overrun()) {
-                        s_overrun = true;
-                    }
-                }
-            }
-            if (s_stop_req) {
-                iis3dwb10is_stop();
-                if (s_direct_stream_active) {
-                    if (s_direct_stream_rows) {
-                        stream_block_t block = {
-                            .index = s_direct_stream_index,
-                            .rows = s_direct_stream_rows,
-                        };
-                        xQueueSend(s_stream_ready, &block, portMAX_DELAY);
-                    } else {
-                        xQueueSend(s_stream_free, &s_direct_stream_index, portMAX_DELAY);
-                    }
-                    s_direct_stream_active = false;
-                    s_direct_stream_rows = 0;
-                }
-                /* Keep the textual STOP reply behind all queued binary data. */
-                while (uxQueueMessagesWaiting(s_stream_free) < STREAM_BUFFERS) {
-                    vTaskDelay(pdMS_TO_TICKS(1));
-                }
-                s_mode = CAP_IDLE;
-                s_stop_req = false;
-                usb_printf("STREAM STOPPED overrun=%d\n", (int)s_overrun);
+                send_data_frame(imu, s_fifo_raw, n);
+                level = (uint16_t)(level - n);
             }
         }
-    }
-}
-
-/* ---- control ----------------------------------------------------------- */
-void capture_start_store(iis3dwb10is_odr_t odr, iis3dwb10is_fs_t fs)
-{
-    if (!s_buf) {
-        return;
-    }
-    if (s_mode != CAP_IDLE) {                 /* keep SPI single-threaded */
-        usb_printf("ERR busy, send STOP first\n");
-        return;
-    }
-    s_last_odr = odr;
-    s_last_fs = fs;
-    s_write_idx = 0;
-    s_rows = 0;
-    s_overrun = false;
-    s_stop_req = false;
-    s_store_start_us = esp_timer_get_time();
-    s_mode = CAP_STORE;
-    iis3dwb10is_start(odr, fs);
-    if (!iis3dwb10is_direct_mode()) {
-        xTaskNotifyGive(s_task);              /* FIFO may already contain rows */
-    }
-    usb_printf("STORE START odr_hz=%lu fs_g=%u cap_bytes=%lu\n",
-               (unsigned long)odr_to_hz(odr), (unsigned)fs_to_g(fs),
-               (unsigned long)s_cap_bytes);
-}
-
-void capture_start_stream(iis3dwb10is_odr_t odr, iis3dwb10is_fs_t fs)
-{
-    if (s_mode != CAP_IDLE) {
-        usb_printf("ERR busy, send STOP first\n");
-        return;
-    }
-    s_last_odr = odr;
-    s_last_fs = fs;
-    s_overrun = false;
-    s_stop_req = false;
-    s_direct_stream_active = false;
-    s_direct_stream_rows = 0;
-    s_mode = CAP_STREAM;
-    usb_printf("STREAM START odr_hz=%lu fs_g=%u "
-               "(binary follows; send STOP to end)\n",
-               (unsigned long)odr_to_hz(odr), (unsigned)fs_to_g(fs));
-    iis3dwb10is_start(odr, fs);
-    if (!iis3dwb10is_direct_mode()) {
-        xTaskNotifyGive(s_task);   /* FIFO may already contain rows */
-    }
-}
-
-void capture_stop(void)
-{
-    if (s_mode != CAP_IDLE) {
-        s_stop_req = true;
-        xTaskNotifyGive(s_task);
+        if (s_stop_requested) {
+            lsm6dsv320x_capture_stop();
+            /* Flush the finite tail before reporting completion. */
+            for (unsigned imu = 0; imu < LSM6DSV320X_COUNT; ++imu) {
+                if (!(lsm6dsv320x_present_mask() & (1U << imu))) continue;
+                uint16_t level = lsm6dsv320x_fifo_level(imu);
+                while (level) {
+                    const uint16_t n = level > CHUNK_ROWS ? CHUNK_ROWS : level;
+                    if (lsm6dsv320x_fifo_read(imu, s_fifo_raw, n) != ESP_OK) break;
+                    send_data_frame(imu, s_fifo_raw, n);
+                    level = (uint16_t)(level - n);
+                }
+            }
+            lsm6dsv320x_capture_finish();
+            send_end_frame();
+            s_stop_requested = false;
+            s_running = false;
+            continue;
+        }
+        /* Yield every 1 ms so lower-priority TCP/USB work and the idle task run;
+           the FIFOs absorb this bounded interval while all four are drained. */
+        vTaskDelay(1);
     }
 }
 
 esp_err_t capture_init(void)
 {
-    size_t psz = esp_psram_get_size();
-    if (psz == 0) {
-        ESP_LOGE(TAG, "no PSRAM detected — this firmware needs octal PSRAM");
-        return ESP_ERR_NO_MEM;
+    s_control_lock = xSemaphoreCreateMutex();
+    if (!s_control_lock) return ESP_ERR_NO_MEM;
+    s_wifi_tx_buffer = xStreamBufferCreateStatic(
+        WIFI_TX_BUFFER_BYTES, 1U, s_wifi_tx_storage, &s_wifi_tx_buffer_control);
+    if (!s_wifi_tx_buffer) return ESP_ERR_NO_MEM;
+    BaseType_t ok = xTaskCreate(wifi_tx_task, "wifi_tx", 4096, NULL,
+                                CAPTURE_TASK_PRIORITY, &s_wifi_tx_task);
+    if (ok != pdPASS) return ESP_ERR_NO_MEM;
+    ok = xTaskCreate(capture_task, "capture", 4096, NULL,
+                     CAPTURE_TASK_PRIORITY, &s_task);
+    if (ok != pdPASS) {
+        vTaskDelete(s_wifi_tx_task);
+        s_wifi_tx_task = NULL;
     }
-    s_psram_size = (uint32_t)psz;
+    return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+}
 
-    uint32_t cap = (uint32_t)(psz / 10u) * 9u;        /* 90 % */
-    if (cap > CAP_MAX_BYTES) {
-        cap = CAP_MAX_BYTES;
-    }
-    cap -= (cap % FIFO_ROW_BYTES);                    /* whole rows */
-    s_buf = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
-    if (!s_buf) {
-        ESP_LOGE(TAG, "PSRAM malloc of %lu bytes failed", (unsigned long)cap);
-        return ESP_ERR_NO_MEM;
-    }
-    s_cap_bytes = cap;
-    s_write_idx = 0;
-    s_rows = 0;
-    s_overrun = false;
+bool capture_control_lock(void)
+{
+    return s_control_lock && xSemaphoreTake(s_control_lock, portMAX_DELAY) == pdTRUE;
+}
 
-    s_stream_free = xQueueCreate(STREAM_BUFFERS, sizeof(uint8_t));
-    s_stream_ready = xQueueCreate(STREAM_BUFFERS, sizeof(stream_block_t));
-    if (!s_stream_free || !s_stream_ready) {
-        ESP_LOGE(TAG, "failed to allocate STREAM queues");
-        return ESP_ERR_NO_MEM;
-    }
-    for (uint8_t i = 0; i < STREAM_BUFFERS; ++i) {
-        xQueueSend(s_stream_free, &i, portMAX_DELAY);
-    }
+void capture_control_unlock(void)
+{
+    xSemaphoreGive(s_control_lock);
+}
 
-    xTaskCreatePinnedToCore(capture_task, "capture", 4096, NULL,
-                            configMAX_PRIORITIES - 2, &s_task, 1);
-    xTaskCreatePinnedToCore(stream_tx_task, "stream_tx", 4096, NULL,
-                            configMAX_PRIORITIES - 3, NULL, 0);
-    iis3dwb10is_set_int1_callback(on_int1, NULL);
+bool capture_start(void)
+{
+    if (!s_task || s_running || lsm6dsv320x_present_mask() == 0U) return false;
+    s_wifi_output = false;
+    memset(s_counts, 0, sizeof(s_counts));
+    s_overrun_mask = 0;
+    s_stop_requested = false;
+    lsm6dsv320x_capture_start();
+    s_started_us = esp_timer_get_time();
+    s_running = true;
+    xTaskNotifyGive(s_task);
+    return true;
+}
 
-    ESP_LOGI(TAG, "PSRAM %lu KB, capture buffer %lu KB (%lu rows, ~%lu s @80kHz)",
-             (unsigned long)(psz / 1024), (unsigned long)(cap / 1024),
-             (unsigned long)(cap / FIFO_ROW_BYTES),
-             (unsigned long)(cap / FIFO_ROW_BYTES / 80000));
-    return ESP_OK;
+bool capture_start_wifi(void)
+{
+    if (!s_task || s_running || lsm6dsv320x_present_mask() == 0U ||
+        !wifi_stream_client_connected()) return false;
+    s_wifi_output = true;
+    memset(s_counts, 0, sizeof(s_counts));
+    s_overrun_mask = 0;
+    /* The previous capture waited for TX completion; no reset of a stream
+       buffer with a blocked reader is needed. */
+    s_stop_requested = false;
+    lsm6dsv320x_capture_start();
+    s_started_us = esp_timer_get_time();
+    s_running = true;
+    xTaskNotifyGive(s_task);
+    return true;
+}
+
+void capture_stop(void)
+{
+    if (s_running) s_stop_requested = true;
+}
+
+bool capture_running(void)
+{
+    return s_running;
+}
+
+bool capture_wifi_active(void)
+{
+    return s_running && s_wifi_output;
+}
+
+uint8_t capture_overrun_mask(void)
+{
+    return s_overrun_mask;
 }

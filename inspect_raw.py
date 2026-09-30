@@ -2,7 +2,8 @@
 """Capture and interactively inspect raw BowVib IMU samples.
 
 Examples:
-    python inspect_raw.py --port COM53
+    python inspect_raw.py --port COM92
+    python inspect_raw.py --wifi --seconds 5 --plot-png wifi.png --no-gui
     python inspect_raw.py raw_capture.npz
     python inspect_raw.py old_counts.npy --rate 80000 --fs 200
     python inspect_raw.py --demo
@@ -15,8 +16,11 @@ button (or press Z) to zoom to the interval between the cursors.
 from __future__ import annotations
 
 import argparse
+import math
+import socket
 import struct
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,10 +28,68 @@ from pathlib import Path
 import numpy as np
 
 
-ROW_BYTES = 10
-ACCEL_TAG = 0x10
-MILLIG_PER_LSB = {50: 0.095, 100: 0.191, 200: 0.381}
-ODR_CHOICES = (2500, 5000, 10000, 20000, 40000, 80000)
+ROW_BYTES = 6
+SENSOR_COUNT = 4
+MILLIG_PER_LSB = {50: 0.095, 100: 0.191, 200: 0.381, 320: 10.417}
+HG_ODR_HZ = 7680
+MAX_FRAME_ROWS = 256
+
+
+def read_frame(read_exact_fn) -> tuple:
+    """Read and validate one IM4 frame through either transport."""
+    magic = read_exact_fn(4, timeout=15.0)
+    if magic == b"IM4D":
+        meta = read_exact_fn(3, timeout=3.0)
+        sensor, rows = meta[0], struct.unpack_from("<H", meta, 1)[0]
+        if sensor >= SENSOR_COUNT or not 1 <= rows <= MAX_FRAME_ROWS:
+            raise RuntimeError(f"invalid data frame sensor={sensor} rows={rows}")
+        return magic, sensor, decode_hg_samples(
+            read_exact_fn(rows * ROW_BYTES, timeout=10.0)
+        )
+    if magic == b"IM4E":
+        footer = read_exact_fn(SENSOR_COUNT * 4 + 5, timeout=3.0)
+        counts = struct.unpack_from("<4I", footer, 0)
+        duration_ms = struct.unpack_from("<I", footer, SENSOR_COUNT * 4)[0]
+        if duration_ms == 0:
+            raise RuntimeError("board reported a zero-length capture")
+        return magic, counts, duration_ms / 1000.0, footer[-1]
+    raise RuntimeError(f"invalid stream frame magic {magic!r}")
+
+
+def archive_payload(arrays: tuple[np.ndarray, ...] | list[np.ndarray],
+                    sensor_ids: tuple[int, ...], duration: float,
+                    overrun_mask: int) -> dict[str, object]:
+    """Keep full channels and include a common-length view for the inspector."""
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("capture duration must be finite and greater than zero")
+    if not sensor_ids or len(set(sensor_ids)) != len(sensor_ids) or any(
+            sensor_id not in range(1, SENSOR_COUNT + 1) for sensor_id in sensor_ids):
+        raise ValueError("invalid sensor IDs")
+    counts = np.asarray([len(values) for values in arrays], dtype=np.uint32)
+    active = np.asarray(sensor_ids) - 1
+    common = int(counts[active].min())
+    if common < 2:
+        raise ValueError("capture returned fewer than two samples per active IMU")
+    rates = counts.astype(np.float64) / duration
+    return {
+        **{f"imu{i + 1}_samples_lsb": values for i, values in enumerate(arrays)},
+        "samples_lsb": np.stack([arrays[i][:common] for i in active]),
+        "sensor_counts": counts,
+        "sensor_sample_rates_hz": rates,
+        "sample_rate_hz": np.float64(rates[active].mean()),
+        "sensor_ids": np.asarray(sensor_ids, dtype=np.uint8),
+        "configured_sample_rate_hz": np.uint32(HG_ODR_HZ),
+        "capture_duration_s": np.float64(duration),
+        "full_scale_g": np.uint16(320),
+        "output_bits": np.uint16(16),
+        "overrun_mask": np.uint8(overrun_mask),
+        "overrun_mask_valid": np.uint8(1),
+    }
+
+
+def sensor_label(sensor_id: int) -> str:
+    letter = chr(ord("A") + sensor_id - 1)
+    return f"Sensor {letter} (IMU {sensor_id})"
 
 
 @dataclass
@@ -36,64 +98,50 @@ class DataSet:
     sample_rate_hz: float
     unit: str
     source: str
+    sensor_ids: tuple[int, ...] = (1,)
 
 
 @dataclass
 class CaptureResult:
-    samples_lsb: np.ndarray
+    samples_lsb: np.ndarray  # equal-length view for plotting
+    sensor_samples_lsb: tuple[np.ndarray, ...]  # full, untrimmed channels
     sample_rate_hz: float
+    sensor_sample_rates_hz: np.ndarray
     configured_sample_rate_hz: int
     capture_duration_s: float
     full_scale_g: int
     output_bits: int
-    overrun: bool
+    sensor_counts: np.ndarray
+    overrun_mask: int
+    sensor_ids: tuple[int, ...]
 
 
 def normalize_xyz(samples: np.ndarray) -> np.ndarray:
-    """Return a finite Nx3 array without changing its numeric values."""
+    """Validate Nx3 single-sensor or 4xNx3 multi-sensor samples."""
     values = np.asarray(samples)
-    if values.ndim != 2:
-        raise ValueError(f"expected a 2-D sample array, got shape {values.shape}")
-    if values.shape[1] != 3 and values.shape[0] == 3:
-        values = values.T
-    if values.shape[1] != 3:
-        raise ValueError(f"expected Nx3 XYZ samples, got shape {values.shape}")
-    if len(values) < 2:
-        raise ValueError("at least two samples are required")
+    if values.ndim == 2:
+        if values.shape[1] != 3 and values.shape[0] == 3:
+            values = values.T
+        if values.ndim != 2 or values.shape[1] != 3:
+            raise ValueError(f"expected Nx3 XYZ samples, got shape {values.shape}")
+        if len(values) < 2:
+            raise ValueError("at least two samples are required")
+    elif values.ndim == 3 and values.shape[0] > 0 and values.shape[2] == 3:
+        if values.shape[1] < 2:
+            raise ValueError("at least two samples per sensor are required")
+    else:
+        raise ValueError(f"expected Nx3 or 4xNx3 XYZ samples, got shape {values.shape}")
     if not np.isfinite(values).all():
         raise ValueError("sample data contains NaN or infinite values")
     return values
 
 
-def decode_rows(data: bytes | bytearray | memoryview) -> np.ndarray:
-    """Decode tagged 10-byte FIFO rows into signed 20-bit XYZ counts."""
-    raw = np.frombuffer(data, dtype=np.uint8)
-    if raw.size % ROW_BYTES:
-        raise ValueError("raw dump length is not a whole number of rows")
-    rows = raw.reshape(-1, ROW_BYTES)
-    invalid = np.flatnonzero(rows[:, 0] != ACCEL_TAG)
-    if invalid.size:
-        index = int(invalid[0])
-        tags, counts = np.unique(rows[invalid, 0], return_counts=True)
-        summary = ", ".join(
-            f"0x{int(tag):02x}:{int(count):,}"
-            for tag, count in zip(tags[:6], counts[:6], strict=True)
-        )
-        raise ValueError(
-            f"invalid FIFO tag 0x{rows[index, 0]:02x} at row {index}; "
-            f"{invalid.size:,}/{len(rows):,} rows invalid ({summary})"
-        )
-
-    xyz = np.empty((len(rows), 3), dtype=np.int32)
-    for axis, offset in enumerate((1, 4, 7)):
-        value = (
-            rows[:, offset].astype(np.int32)
-            | (rows[:, offset + 1].astype(np.int32) << 8)
-            | (rows[:, offset + 2].astype(np.int32) << 16)
-        )
-        value &= 0xFFFFF
-        xyz[:, axis] = np.where(value & 0x80000, value - 0x100000, value)
-    return xyz
+def decode_hg_samples(data: bytes | bytearray | memoryview) -> np.ndarray:
+    """Decode little-endian signed 16-bit high-g XYZ samples."""
+    raw = np.frombuffer(data, dtype="<i2")
+    if raw.size % 3:
+        raise ValueError("high-g data length is not a whole number of XYZ samples")
+    return raw.reshape(-1, 3).astype(np.int32, copy=True)
 
 
 def read_line(serial_port, timeout: float) -> str:
@@ -121,7 +169,7 @@ def read_exact(serial_port, byte_count: int, timeout: float) -> bytes:
             result.extend(chunk)
     if len(result) != byte_count:
         raise TimeoutError(
-            f"USB dump stopped after {len(result):,}/{byte_count:,} bytes"
+            f"USB transfer stopped after {len(result):,}/{byte_count:,} bytes"
         )
     return bytes(result)
 
@@ -146,14 +194,13 @@ def line_integer(line: str, key: str) -> int:
     prefix = key + "="
     for token in line.split():
         if token.startswith(prefix):
-            return int(token[len(prefix):])
+            value = token[len(prefix):]
+            return int(value, 16) if key == "present_mask" else int(value)
     raise ValueError(f"board response is missing {key}=...: {line}")
 
 
-def capture_serial(
-    port: str, seconds: float, rate: int, full_scale: int
-) -> CaptureResult:
-    """Store samples in ESP32 PSRAM, then download one framed binary dump."""
+def capture_serial(port: str, seconds: float) -> CaptureResult:
+    """Stream detected high-g FIFO channels from the C6 to the host."""
     try:
         import serial
     except ImportError as exc:
@@ -161,120 +208,203 @@ def capture_serial(
             "serial capture needs pyserial: python -m pip install pyserial"
         ) from exc
 
-    serial_port = serial.Serial(port=None, baudrate=115200, timeout=0.05)
+    serial_port = serial.Serial(port=None, baudrate=115200, timeout=0.1)
     serial_port.dtr = False
     serial_port.rts = False
     serial_port.port = port
-
+    chunks: list[list[np.ndarray]] = [[] for _ in range(SENSOR_COUNT)]
+    started_capture = False
+    stop_sent = False
     try:
         serial_port.open()
         time.sleep(0.5)
         serial_port.reset_input_buffer()
-
-        # Set 20-bit mode first: firmware rejects an ODR above 10 kHz while
-        # left in 16-bit mode by an earlier session.
-        send_and_wait(serial_port, "SET BITS 20", "OK BITS=")
-        send_and_wait(serial_port, f"SET ODR {rate}", "OK ODR=")
-        send_and_wait(serial_port, f"SET FS {full_scale}", "OK FS=")
-        status = send_and_wait(serial_port, "STATUS", "STATUS running=")
-        capacity_bytes = line_integer(status, "cap_bytes")
-        required_bytes = int(np.ceil(seconds * rate)) * ROW_BYTES
-        if capacity_bytes < required_bytes:
-            maximum_seconds = capacity_bytes / (rate * ROW_BYTES)
+        status = send_and_wait(serial_port, "STATUS", "STATUS")
+        present_mask = line_integer(status, "present_mask")
+        sensor_ids = tuple(i + 1 for i in range(SENSOR_COUNT)
+                           if present_mask & (1 << i))
+        if not sensor_ids:
+            raise RuntimeError("board reports no responding IMUs")
+        start = send_and_wait(serial_port, "START", "CAPTURE START")
+        started_capture = True
+        start_mask = line_integer(start, "present_mask")
+        if start_mask != present_mask:
             raise RuntimeError(
-                f"board PSRAM holds only {maximum_seconds:.3f} s at {rate} samples/s; "
-                f"{seconds:g} s needs {required_bytes:,} bytes but capacity is "
-                f"{capacity_bytes:,} bytes"
+                f"sensor presence changed between STATUS and START: "
+                f"0x{present_mask:02X} -> 0x{start_mask:02X}"
             )
-
-        send_and_wait(serial_port, "START", "STORE START")
-        print(
-            f"Recording {seconds:g} s into ESP32 PSRAM at "
-            f"{rate} samples/s (USB data transfer is idle) ..."
-        )
-        capture_started = time.monotonic()
-        deadline = capture_started + seconds
-        next_progress = capture_started + 1.0
-        interrupted = False
-        try:
-            while time.monotonic() < deadline:
-                now = time.monotonic()
-                if now >= next_progress:
-                    elapsed = min(seconds, now - capture_started)
-                    print(f"  recorded {elapsed:.0f}/{seconds:g} s")
-                    next_progress += 1.0
-                time.sleep(min(0.05, max(0.0, deadline - now)))
-        except KeyboardInterrupt:
-            interrupted = True
-            print("\nCapture stopped by user.")
-        capture_status = send_and_wait(serial_port, "STOP", "CAPTURE ", timeout=10.0)
-        duration_ms = line_integer(capture_status, "dur_ms")
-
-        serial_port.write(b"DUMP\n")
-        serial_port.flush()
-        header = read_exact(serial_port, 32, timeout=5.0)
-        if header[:4] != b"BOWV":
-            raise RuntimeError(f"invalid dump magic {header[:4]!r}")
-
-        version = struct.unpack_from("<H", header, 4)[0]
-        configured_rate = struct.unpack_from("<I", header, 6)[0]
-        actual_fs = struct.unpack_from("<H", header, 10)[0]
-        row_bytes = struct.unpack_from("<H", header, 12)[0]
-        sample_count = struct.unpack_from("<I", header, 14)[0]
-        overrun = bool(struct.unpack_from("<H", header, 18)[0])
-        output_bits = struct.unpack_from("<H", header, 20)[0]
-        if version != 1:
-            raise RuntimeError(f"unsupported dump version {version}")
-        if row_bytes != ROW_BYTES:
-            raise RuntimeError(f"unsupported dump row size {row_bytes}")
-        if output_bits != 20:
-            raise RuntimeError(f"expected 20-bit samples, board reported {output_bits}")
-        if configured_rate not in ODR_CHOICES or actual_fs not in MILLIG_PER_LSB:
-            raise RuntimeError(
-                f"invalid dump metadata: rate={configured_rate}, full-scale={actual_fs}"
-            )
-
-        payload_bytes = sample_count * row_bytes
-        print(
-            f"Recording stopped ({capture_status}). Dumping "
-            f"{sample_count:,} samples/{payload_bytes:,} bytes over USB ..."
-        )
-        payload = read_exact(serial_port, payload_bytes, timeout=120.0)
-        samples = decode_rows(payload)
-
-        if not interrupted:
-            if duration_ms < seconds * 1000.0 * 0.98:
-                raise RuntimeError(
-                    f"capture duration is short: board recorded {duration_ms / 1000.0:.6f} s, "
-                    f"requested {seconds:g} s"
-                )
+        print(f"Recording {', '.join(sensor_label(i) for i in sensor_ids)} at "
+              f"{HG_ODR_HZ:,} samples/s, +/-320 g; streaming over USB ...")
+        started = time.monotonic()
+        stop_at = started + seconds
+        stop_sent = False
+        while True:
+            if not stop_sent and time.monotonic() >= stop_at:
+                serial_port.write(b"STOP\n")
+                serial_port.flush()
+                stop_sent = True
+                print("  stopping and collecting FIFO tails ...")
+            frame = read_frame(lambda count, timeout: read_exact(serial_port, count, timeout))
+            if frame[0] == b"IM4D":
+                if frame[1] + 1 not in sensor_ids:
+                    raise RuntimeError("received data from an absent IMU")
+                chunks[frame[1]].append(frame[2])
+            else:
+                sensor_counts = np.asarray(frame[1], dtype=np.uint32)
+                duration_s, overrun_mask = frame[2:]
+                break
     finally:
         if serial_port.is_open:
+            if started_capture and not stop_sent:
+                try:
+                    serial_port.write(b"STOP\n")
+                    serial_port.flush()
+                except OSError:
+                    pass
             serial_port.close()
 
-    if overrun:
-        print("WARNING: the IMU FIFO overran; this recording contains lost samples.")
-    capture_duration_s = duration_ms / 1000.0
-    measured_rate = sample_count / capture_duration_s
-    if not interrupted and measured_rate < configured_rate * 0.95:
-        raise RuntimeError(
-            f"effective acquisition rate is only {measured_rate:,.1f} samples/s "
-            f"({measured_rate / configured_rate:.1%} of configured "
-            f"{configured_rate:,}); check that the updated SPI firmware is flashed"
+    return finish_capture(chunks, sensor_ids, sensor_counts, duration_s, overrun_mask)
+
+
+def read_socket_line(connection: socket.socket, timeout: float) -> str:
+    deadline = time.monotonic() + timeout
+    line = bytearray()
+    while time.monotonic() < deadline:
+        connection.settimeout(max(0.05, deadline - time.monotonic()))
+        try:
+            byte = connection.recv(1)
+        except socket.timeout:
+            continue
+        if not byte:
+            raise ConnectionError("Wi-Fi connection closed while waiting for a line")
+        if byte in (b"\r", b"\n"):
+            if line:
+                return line.decode("ascii", errors="replace").strip()
+        else:
+            line.extend(byte)
+    raise TimeoutError("timed out waiting for board text over Wi-Fi")
+
+
+def read_socket_exact(connection: socket.socket, byte_count: int,
+                       timeout: float) -> bytes:
+    deadline = time.monotonic() + timeout
+    result = bytearray()
+    while len(result) < byte_count and time.monotonic() < deadline:
+        connection.settimeout(max(0.05, deadline - time.monotonic()))
+        try:
+            chunk = connection.recv(min(65536, byte_count - len(result)))
+        except socket.timeout:
+            continue
+        if not chunk:
+            raise ConnectionError(
+                f"Wi-Fi stream closed after {len(result):,}/{byte_count:,} bytes"
+            )
+        result.extend(chunk)
+    if len(result) != byte_count:
+        raise TimeoutError(
+            f"Wi-Fi transfer stopped after {len(result):,}/{byte_count:,} bytes"
         )
-    print(
-        f"Downloaded {len(samples):,} samples "
-        f"({capture_duration_s:.6f} s, effective rate {measured_rate:,.3f} samples/s)."
-    )
-    return CaptureResult(
-        samples,
-        measured_rate,
-        configured_rate,
-        capture_duration_s,
-        actual_fs,
-        output_bits,
-        overrun,
-    )
+    return bytes(result)
+
+
+def capture_wifi(host: str, port: int, seconds: float) -> CaptureResult:
+    """Capture the same IM4 binary stream through the ESP32-C6 TCP access point."""
+    chunks: list[list[np.ndarray]] = [[] for _ in range(SENSOR_COUNT)]
+    stop_timer: threading.Timer | None = None
+    stop_sent = threading.Event()
+    with socket.create_connection((host, port), timeout=10.0) as connection:
+        connection.settimeout(1.0)
+        greeting = read_socket_line(connection, 10.0)
+        print(f"  board> {greeting}")
+        connection.sendall(b"STATUS\n")
+        status = read_socket_line(connection, 4.0)
+        print(f"  board> {status}")
+        if status.startswith("ERR "):
+            raise RuntimeError(status)
+        present_mask = line_integer(status, "present_mask")
+        sensor_ids = tuple(i + 1 for i in range(SENSOR_COUNT)
+                           if present_mask & (1 << i))
+        if not sensor_ids:
+            raise RuntimeError("board reports no responding IMUs")
+
+        connection.sendall(b"START\n")
+        start = read_socket_line(connection, 4.0)
+        print(f"  board> {start}")
+        if start.startswith("ERR "):
+            raise RuntimeError(start)
+        if not start.startswith("CAPTURE START"):
+            raise RuntimeError(f"unexpected start response: {start}")
+        start_mask = line_integer(start, "present_mask")
+        if start_mask != present_mask:
+            raise RuntimeError(
+                f"sensor presence changed between STATUS and START: "
+                f"0x{present_mask:02X} -> 0x{start_mask:02X}"
+            )
+        print(f"Recording {', '.join(sensor_label(i) for i in sensor_ids)} at "
+              f"{HG_ODR_HZ:,} samples/s, +/-320 g; streaming over Wi-Fi ...")
+
+        def send_stop() -> None:
+            try:
+                connection.sendall(b"STOP\n")
+                stop_sent.set()
+            except OSError:
+                pass
+
+        stop_timer = threading.Timer(seconds, send_stop)
+        stop_timer.daemon = True
+        stop_timer.start()
+        if seconds > 0.5:
+            print("  capture in progress ...")
+        try:
+            while True:
+                frame = read_frame(lambda count, timeout: read_socket_exact(connection, count, timeout))
+                if frame[0] == b"IM4D":
+                    if frame[1] + 1 not in sensor_ids:
+                        raise RuntimeError("received data from an absent IMU")
+                    chunks[frame[1]].append(frame[2])
+                else:
+                    sensor_counts = np.asarray(frame[1], dtype=np.uint32)
+                    duration_s, overrun_mask = frame[2:]
+                    break
+        finally:
+            if stop_timer is not None:
+                stop_timer.cancel()
+            if not stop_sent.is_set():
+                send_stop()
+
+    return finish_capture(chunks, sensor_ids, sensor_counts, duration_s, overrun_mask)
+
+
+def finish_capture(chunks, sensor_ids, sensor_counts, duration_s, overrun_mask) -> CaptureResult:
+    """Validate the footer and construct the same result for both transports."""
+    arrays = [np.concatenate(part) if part else np.empty((0, 3), dtype=np.int32)
+              for part in chunks]
+    actual_counts = np.asarray([len(values) for values in arrays], dtype=np.uint32)
+    if not np.array_equal(actual_counts, sensor_counts):
+        raise RuntimeError(f"frame/footer count mismatch: frames={actual_counts}, footer={sensor_counts}")
+    active_indices = np.asarray(sensor_ids, dtype=np.int32) - 1
+    active_counts = actual_counts[active_indices]
+    if np.any(active_counts == 0):
+        raise RuntimeError("capture returned no samples from an active IMU")
+    common_count = int(active_counts.min())
+    if common_count < 2:
+        raise RuntimeError("capture returned fewer than two samples per IMU")
+    if np.any(active_counts != common_count):
+        print(f"  sensor counts differ slightly; trimming each channel to {common_count:,} rows for plotting")
+    samples = np.stack([arrays[i][:common_count] for i in active_indices])
+    sensor_rates = actual_counts.astype(np.float64) / duration_s
+    measured_rate = float(sensor_rates[active_indices].mean())
+    fifo_overrun_mask = overrun_mask & 0x0F
+    if fifo_overrun_mask:
+        print(f"WARNING: sensor FIFO overrun mask=0x{fifo_overrun_mask:X} (bit 0 is IMU 1).")
+    if overrun_mask & 0x80:
+        print("WARNING: output transport overflow or send failure.")
+    print("Samples per sensor: " + ", ".join(
+        f"{sensor_label(i + 1)}={actual_counts[i]:,}" for i in active_indices))
+    print(f"Capture duration {duration_s:.6f} s; mean effective rate {measured_rate:,.2f} samples/s per sensor.")
+    return CaptureResult(samples, tuple(arrays), measured_rate, sensor_rates,
+                         HG_ODR_HZ, duration_s, 320, 16, sensor_counts,
+                         overrun_mask, sensor_ids)
 
 
 def scalar(archive, key: str, default=None):
@@ -296,10 +426,13 @@ def load_file(
     metadata_rate = None
     metadata_fs = None
     metadata_unit = None
+    metadata_sensor_ids = None
     is_counts = False
 
     if path.suffix.lower() == ".npz":
         with np.load(path, allow_pickle=False) as archive:
+            if "sensor_ids" in archive.files:
+                metadata_sensor_ids = tuple(int(i) for i in np.asarray(archive["sensor_ids"]).reshape(-1))
             if "samples_lsb" in archive.files:
                 samples = archive["samples_lsb"]
                 is_counts = True
@@ -309,11 +442,27 @@ def load_file(
                 samples = archive["xyz"]
             elif "arr_0" in archive.files:
                 samples = archive["arr_0"]
+            elif any(f"imu{i}_samples_lsb" in archive.files for i in range(1, 5)):
+                ids = metadata_sensor_ids or tuple(
+                    i for i in range(1, 5) if f"imu{i}_samples_lsb" in archive.files
+                    and len(archive[f"imu{i}_samples_lsb"]) > 0
+                )
+                arrays = [archive[f"imu{i}_samples_lsb"] for i in ids]
+                if not arrays:
+                    raise ValueError("archive contains no active IMU samples")
+                common = min(len(values) for values in arrays)
+                samples = np.stack([values[:common] for values in arrays])
+                metadata_sensor_ids = ids
+                is_counts = True
             else:
                 raise ValueError(
                     f"{path} has no samples_lsb, samples, xyz, or arr_0 array"
                 )
             metadata_rate = scalar(archive, "sample_rate_hz")
+            if metadata_rate is None and "sensor_sample_rates_hz" in archive.files:
+                if metadata_sensor_ids:
+                    rates = np.asarray(archive["sensor_sample_rates_hz"])
+                    metadata_rate = float(rates[np.asarray(metadata_sensor_ids) - 1].mean())
             metadata_fs = scalar(archive, "full_scale_g")
             metadata_unit = scalar(archive, "unit")
     elif path.suffix.lower() == ".npy":
@@ -323,11 +472,12 @@ def load_file(
         raise ValueError("input must be a .npy or .npz file")
 
     samples = normalize_xyz(samples)
-    rate = float(rate_override if rate_override is not None else metadata_rate or 80000)
-    if rate <= 0:
+    rate = float(rate_override if rate_override is not None else
+                 metadata_rate if metadata_rate is not None else HG_ODR_HZ)
+    if not math.isfinite(rate) or rate <= 0:
         raise ValueError("sample rate must be greater than zero")
     if rate_override is None and metadata_rate is None:
-        print("No sample-rate metadata found; using the firmware default of 80000 Hz.")
+        print("No sample-rate metadata found; using 7680 Hz; use --rate for legacy captures.")
 
     effective_fs = int(metadata_fs if metadata_fs is not None else full_scale)
     if effective_fs not in MILLIG_PER_LSB:
@@ -338,7 +488,11 @@ def load_file(
         unit = "g"
     else:
         unit = unit_override or ("LSB" if is_counts else str(metadata_unit or "g"))
-    return DataSet(samples, rate, unit, str(path))
+    sensor_count = samples.shape[0] if samples.ndim == 3 else 1
+    sensor_ids = metadata_sensor_ids or tuple(range(1, sensor_count + 1))
+    if len(sensor_ids) != sensor_count:
+        raise ValueError("sensor_ids metadata does not match the sample channels")
+    return DataSet(samples, rate, unit, str(path), sensor_ids)
 
 
 def demo_data(show_counts: bool) -> DataSet:
@@ -374,7 +528,10 @@ class InteractiveInspector:
         self.data = data
         self.values = normalize_xyz(data.samples)
         self.rate = data.sample_rate_hz
-        self.duration = (len(self.values) - 1) / self.rate
+        self.sensor_count = self.values.shape[0] if self.values.ndim == 3 else 1
+        self.sensor_ids = data.sensor_ids
+        self.sample_count = self.values.shape[1] if self.values.ndim == 3 else self.values.shape[0]
+        self.duration = (self.sample_count - 1) / self.rate
         self.cursor_times = [self.duration / 3.0, self.duration * 2.0 / 3.0]
         self.dragging: int | None = None
         self._updating_view = False
@@ -384,27 +541,37 @@ class InteractiveInspector:
         self.figure.canvas.manager.set_window_title("BowVib raw-data inspector")
         self.figure.subplots_adjust(top=0.88, bottom=0.23, hspace=0.08)
         self.figure.suptitle(
-            f"{data.source} | {len(self.values):,} samples | "
+            f"{data.source} | {self.sample_count:,} samples x {self.sensor_count} IMUs | "
             f"{self.rate:g} samples/s"
         )
 
         axis_names = ("X", "Y", "Z")
         self.data_lines = []
         self.cursor_lines = [[], []]
-        self.cursor_markers = [[], []]
+        self.cursor_markers = [[[] for _ in range(3)] for _ in range(2)]
         cursor_colors = ("tab:red", "tab:purple")
         for axis_index, axis in enumerate(self.axes):
-            line, = axis.plot([], [], color=f"C{axis_index}", linewidth=0.8)
-            self.data_lines.append(line)
+            axis_lines = []
+            for sensor_index in range(self.sensor_count):
+                line, = axis.plot([], [], linewidth=0.8,
+                                  label=sensor_label(self.sensor_ids[sensor_index]))
+                axis_lines.append(line)
+            self.data_lines.append(axis_lines)
+            if axis_index == 0:
+                axis.legend(loc="upper right", ncol=4, fontsize=8)
             axis.set_ylabel(f"{axis_names[axis_index]} [{data.unit}]")
             axis.grid(True, alpha=0.25)
             for cursor_index, color in enumerate(cursor_colors):
                 cursor_line = axis.axvline(
                     self.cursor_times[cursor_index], color=color, linewidth=1.2
                 )
-                marker, = axis.plot([], [], "o", color=color, markersize=5)
+                markers = []
+                for sensor_index in range(self.sensor_count):
+                    marker, = axis.plot([], [], "o", color=color, markersize=5,
+                                        markerfacecolor="none" if sensor_index else color)
+                    markers.append(marker)
                 self.cursor_lines[cursor_index].append(cursor_line)
-                self.cursor_markers[cursor_index].append(marker)
+                self.cursor_markers[cursor_index][axis_index] = markers
         self.axes[-1].set_xlabel("time [s]")
 
         self.readout = self.figure.text(
@@ -428,7 +595,7 @@ class InteractiveInspector:
         self._refresh_cursors()
 
     def _sample_index(self, time_seconds: float) -> int:
-        return int(np.clip(round(time_seconds * self.rate), 0, len(self.values) - 1))
+        return int(np.clip(round(time_seconds * self.rate), 0, self.sample_count - 1))
 
     def _view_changed(self, _axis=None) -> None:
         if not self._updating_view:
@@ -441,9 +608,9 @@ class InteractiveInspector:
             left = max(0.0, left)
             right = min(self.duration, right)
             first = max(0, int(np.floor(left * self.rate)))
-            last = min(len(self.values), int(np.ceil(right * self.rate)) + 1)
+            last = min(self.sample_count, int(np.ceil(right * self.rate)) + 1)
             if last <= first:
-                last = min(len(self.values), first + 1)
+                last = min(self.sample_count, first + 1)
 
             count = last - first
             if count > self.MAX_VISIBLE_POINTS:
@@ -455,13 +622,17 @@ class InteractiveInspector:
                 indices = np.arange(first, last, dtype=np.int64)
             visible_time = indices.astype(np.float64) / self.rate
 
-            segment = self.values[first:last]
+            segment = (self.values[:, first:last, :] if self.values.ndim == 3
+                       else self.values[first:last, :])
             for axis_index, axis in enumerate(self.axes):
-                self.data_lines[axis_index].set_data(
-                    visible_time, self.values[indices, axis_index]
-                )
-                low = float(np.min(segment[:, axis_index]))
-                high = float(np.max(segment[:, axis_index]))
+                for sensor_index in range(self.sensor_count):
+                    series = (self.values[sensor_index, indices, axis_index]
+                              if self.values.ndim == 3
+                              else self.values[indices, axis_index])
+                    self.data_lines[axis_index][sensor_index].set_data(visible_time, series)
+                values = segment[:, :, axis_index] if self.values.ndim == 3 else segment[:, axis_index]
+                low = float(np.min(values))
+                high = float(np.max(values))
                 span = high - low
                 padding = max(span * 0.08, abs(low) * 0.01, 1e-9)
                 axis.set_ylim(low - padding, high + padding)
@@ -477,34 +648,43 @@ class InteractiveInspector:
         for cursor_index, sample_index in enumerate(indices):
             cursor_time = snapped_times[cursor_index]
             for axis_index in range(3):
-                self.cursor_lines[cursor_index][axis_index].set_xdata(
-                    [cursor_time, cursor_time]
-                )
-                self.cursor_markers[cursor_index][axis_index].set_data(
-                    [cursor_time], [self.values[sample_index, axis_index]]
-                )
+                self.cursor_lines[cursor_index][axis_index].set_xdata([cursor_time, cursor_time])
+                for sensor_index in range(self.sensor_count):
+                    value = (self.values[sensor_index, sample_index, axis_index]
+                             if self.values.ndim == 3
+                             else self.values[sample_index, axis_index])
+                    self.cursor_markers[cursor_index][axis_index][sensor_index].set_data(
+                        [cursor_time], [value])
 
-        sample_a = self.values[indices[0]].astype(np.float64)
-        sample_b = self.values[indices[1]].astype(np.float64)
+        sample_a = (self.values[:, indices[0], :].astype(np.float64)
+                    if self.values.ndim == 3 else self.values[indices[0]].astype(np.float64))
+        sample_b = (self.values[:, indices[1], :].astype(np.float64)
+                    if self.values.ndim == 3 else self.values[indices[1]].astype(np.float64))
         delta_t = abs(snapped_times[1] - snapped_times[0])
         frequency = np.inf if delta_t == 0.0 else 1.0 / delta_t
         delta_amplitude = sample_b - sample_a
         half_span = np.abs(delta_amplitude) / 2.0
 
         def xyz(values: np.ndarray) -> str:
-            return "  ".join(
-                f"{name}={value:+.7g}" for name, value in zip("XYZ", values)
-            )
+            return "  ".join(f"{name}={value:+.7g}" for name, value in zip("XYZ", values))
 
         frequency_text = "infinite" if not np.isfinite(frequency) else f"{frequency:.7g} Hz"
-        self.readout.set_text(
-            f"A: t={snapped_times[0]:.9f} s  sample={indices[0]:,}  {xyz(sample_a)} {self.data.unit}\n"
-            f"B: t={snapped_times[1]:.9f} s  sample={indices[1]:,}  {xyz(sample_b)} {self.data.unit}\n"
-            f"delta-t={delta_t:.9g} s   1/delta-t={frequency_text}   "
-            f"delta: {xyz(delta_amplitude)} {self.data.unit}\n"
-            f"half |delta| (peak estimate): {xyz(half_span)} {self.data.unit}   "
-            "Drag either cursor; Z=zoom A-B; R=reset; wheel=zoom"
-        )
+        if self.values.ndim == 3:
+            a_text = "\n".join(f"{sensor_label(self.sensor_ids[i])} A: {xyz(sample_a[i])}" for i in range(self.sensor_count))
+            b_text = "\n".join(f"{sensor_label(self.sensor_ids[i])} B: {xyz(sample_b[i])}  delta: {xyz(delta_amplitude[i])}" for i in range(self.sensor_count))
+            self.readout.set_text(
+                f"A t={snapped_times[0]:.9f} s sample={indices[0]:,} [{self.data.unit}]\n"
+                f"{a_text}\nB t={snapped_times[1]:.9f} s sample={indices[1]:,}  "
+                f"delta-t={delta_t:.9g} s  1/delta-t={frequency_text} [{self.data.unit}]\n"
+                f"{b_text}\nDrag either cursor; Z=zoom A-B; R=reset; wheel=zoom")
+        else:
+            self.readout.set_text(
+                f"A: t={snapped_times[0]:.9f} s  sample={indices[0]:,}  {xyz(sample_a)} {self.data.unit}\n"
+                f"B: t={snapped_times[1]:.9f} s  sample={indices[1]:,}  {xyz(sample_b)} {self.data.unit}\n"
+                f"delta-t={delta_t:.9g} s   1/delta-t={frequency_text}   "
+                f"delta: {xyz(delta_amplitude)} {self.data.unit}\n"
+                f"half |delta| (peak estimate): {xyz(half_span)} {self.data.unit}   "
+                "Drag either cursor; Z=zoom A-B; R=reset; wheel=zoom")
         self.figure.canvas.draw_idle()
 
     def _toolbar_is_active(self) -> bool:
@@ -568,39 +748,83 @@ class InteractiveInspector:
 
 
 def summarize(data: DataSet) -> None:
-    duration = (len(data.samples) - 1) / data.sample_rate_hz
-    minimum = np.min(data.samples, axis=0)
-    maximum = np.max(data.samples, axis=0)
-    print(
-        f"{data.source}: {len(data.samples):,} samples, "
-        f"{data.sample_rate_hz:g} samples/s, {duration:.9g} s"
-    )
-    print(
-        f"range [{data.unit}]  "
-        + "  ".join(
+    sample_count = data.samples.shape[1] if data.samples.ndim == 3 else len(data.samples)
+    duration = (sample_count - 1) / data.sample_rate_hz
+    minimum = np.min(data.samples, axis=1 if data.samples.ndim == 3 else 0)
+    maximum = np.max(data.samples, axis=1 if data.samples.ndim == 3 else 0)
+    sensor_note = f" x {data.samples.shape[0]} IMUs" if data.samples.ndim == 3 else ""
+    print(f"{data.source}: {sample_count:,} samples{sensor_note}, "
+          f"{data.sample_rate_hz:g} samples/s, {duration:.9g} s")
+    if data.samples.ndim == 3:
+        for sensor in range(data.samples.shape[0]):
+            print(f"{sensor_label(data.sensor_ids[sensor])} range [{data.unit}]  " + "  ".join(
+                f"{name}={low:+.7g}..{high:+.7g}"
+                for name, low, high in zip("XYZ", minimum[sensor], maximum[sensor])))
+    else:
+        print(f"range [{data.unit}]  " + "  ".join(
             f"{name}={low:+.7g}..{high:+.7g}"
-            for name, low, high in zip("XYZ", minimum, maximum)
+            for name, low, high in zip("XYZ", minimum, maximum)))
+
+
+def save_plot(data: DataSet, output: Path) -> None:
+    """Save a static three-axis plot without requiring a desktop GUI."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError(
+            "plot export needs Matplotlib: python -m pip install matplotlib"
+        ) from exc
+
+    values = normalize_xyz(data.samples)
+    count = values.shape[1] if values.ndim == 3 else values.shape[0]
+    indices = np.arange(count)
+    if count > InteractiveInspector.MAX_VISIBLE_POINTS:
+        indices = np.linspace(
+            0, count - 1, InteractiveInspector.MAX_VISIBLE_POINTS, dtype=np.int64
         )
+    times = indices.astype(np.float64) / data.sample_rate_hz
+    figure, axes = plt.subplots(3, 1, figsize=(13, 8), sharex=True)
+    for axis_index, axis in enumerate(axes):
+        for sensor_index, sensor_id in enumerate(data.sensor_ids):
+            series = (values[sensor_index, indices, axis_index]
+                      if values.ndim == 3 else values[indices, axis_index])
+            axis.plot(times, series, linewidth=0.8, label=sensor_label(sensor_id))
+        axis.set_ylabel(f"{'XYZ'[axis_index]} [{data.unit}]")
+        axis.grid(True, alpha=0.25)
+    axes[0].legend(loc="upper right")
+    axes[-1].set_xlabel("time [s]")
+    figure.suptitle(
+        f"{data.source} | {count:,} samples | {data.sample_rate_hz:g} samples/s"
     )
+    figure.tight_layout()
+    figure.savefig(output, dpi=160)
+    plt.close(figure)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("file", nargs="?", type=Path, help="raw .npy or .npz file")
-    parser.add_argument("--port", help="capture from the board, for example COM53")
+    parser.add_argument("--port", help="capture from the board, for example COM92")
+    parser.add_argument(
+        "--wifi", metavar="HOST", nargs="?", const="192.168.4.1",
+        help="capture over Wi-Fi from the board (default host 192.168.4.1)",
+    )
+    parser.add_argument("--wifi-port", type=int, default=3333,
+                        help="Wi-Fi TCP port (default: 3333)")
     parser.add_argument(
         "--seconds", type=float, default=10.0,
-        help="PSRAM recording duration (default: 10 seconds)",
+        help="live capture duration (default: 10 seconds)",
     )
-    parser.add_argument(
-        "--rate", type=float, help="sample rate in Hz (capture default: 80000)"
-    )
-    parser.add_argument("--fs", type=int, choices=(50, 100, 200), default=200)
+    parser.add_argument("--rate", type=float, help="capture is fixed at 7680 Hz per sensor")
+    parser.add_argument("--fs", type=int, choices=(50, 100, 200, 320), default=320)
     parser.add_argument("--save", type=Path, help="capture output (default: raw_capture.npz)")
     parser.add_argument("--overwrite", action="store_true", help="replace capture output")
     parser.add_argument("--counts", action="store_true", help="display raw LSB counts")
     parser.add_argument("--unit", help="unit label for floating-point .npy input")
     parser.add_argument("--demo", action="store_true", help="open a synthetic cursor demo")
+    parser.add_argument("--plot-png", type=Path, help="save a static plot as PNG")
     parser.add_argument("--no-gui", action="store_true", help="print summary without plotting")
     return parser
 
@@ -608,43 +832,41 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    source_count = int(args.file is not None) + int(args.port is not None) + int(args.demo)
+    source_count = (int(args.file is not None) + int(args.port is not None) +
+                    int(args.wifi is not None) + int(args.demo))
     if source_count != 1:
-        parser.error("choose exactly one source: FILE, --port, or --demo")
-    if args.seconds <= 0:
+        parser.error("choose exactly one source: FILE, --port, --wifi, or --demo")
+    if not math.isfinite(args.seconds) or args.seconds <= 0:
         parser.error("--seconds must be greater than zero")
-    if args.rate is not None and args.rate <= 0:
+    if args.rate is not None and (not math.isfinite(args.rate) or args.rate <= 0):
         parser.error("--rate must be greater than zero")
 
     try:
-        if args.port:
-            capture_rate = int(args.rate or 80000)
-            if capture_rate not in ODR_CHOICES:
-                parser.error("capture --rate must be one of " + ", ".join(map(str, ODR_CHOICES)))
+        if args.port or args.wifi is not None:
+            capture_rate = args.rate or HG_ODR_HZ
+            if capture_rate != HG_ODR_HZ:
+                parser.error(f"capture rate is fixed at {HG_ODR_HZ} Hz per sensor")
             output = args.save or Path("raw_capture.npz")
             if output.suffix.lower() != ".npz":
                 raise ValueError("capture output must use the .npz extension")
             if output.exists() and not args.overwrite:
                 raise FileExistsError(f"{output} already exists; use --overwrite to replace it")
-            capture = capture_serial(args.port, args.seconds, capture_rate, args.fs)
+            if args.fs != 320:
+                parser.error("capture full scale is fixed at 320 g")
+            capture = (capture_serial(args.port, args.seconds) if args.port else
+                       capture_wifi(args.wifi, args.wifi_port, args.seconds))
             counts = capture.samples_lsb
             np.savez_compressed(
                 output,
-                samples_lsb=counts.astype(np.int32, copy=False),
-                sample_rate_hz=np.float64(capture.sample_rate_hz),
-                configured_sample_rate_hz=np.int32(
-                    capture.configured_sample_rate_hz
-                ),
-                capture_duration_s=np.float64(capture.capture_duration_s),
-                full_scale_g=np.int16(capture.full_scale_g),
-                output_bits=np.int16(capture.output_bits),
-                overrun=np.bool_(capture.overrun),
+                **archive_payload(capture.sensor_samples_lsb, capture.sensor_ids,
+                                  capture.capture_duration_s, capture.overrun_mask),
                 requested_duration_s=np.float64(args.seconds),
             )
             print(f"Saved exact raw counts and metadata to {output}.")
             if args.counts:
                 data = DataSet(
-                    counts, float(capture.sample_rate_hz), "LSB", str(output)
+                    counts, float(capture.sample_rate_hz), "LSB", str(output),
+                    capture.sensor_ids,
                 )
             else:
                 scale = MILLIG_PER_LSB[capture.full_scale_g] / 1000.0
@@ -653,6 +875,7 @@ def main() -> int:
                     float(capture.sample_rate_hz),
                     "g",
                     str(output),
+                    capture.sensor_ids,
                 )
         elif args.demo:
             data = demo_data(args.counts)
@@ -660,6 +883,9 @@ def main() -> int:
             data = load_file(args.file, args.rate, args.fs, args.counts, args.unit)
 
         summarize(data)
+        if args.plot_png:
+            save_plot(data, args.plot_png)
+            print(f"Saved plot to {args.plot_png}.")
         if not args.no_gui:
             InteractiveInspector(data).show()
     except (FileNotFoundError, OSError, RuntimeError, TimeoutError, ValueError) as exc:

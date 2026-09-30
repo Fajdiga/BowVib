@@ -1,14 +1,16 @@
 /*
  * usb.h — USB-Serial-JTAG command + binary-data channel.
- * (Console/ESP_LOG stays on UART0; this native "USB" port is the app interface.)
+ * Console logging is disabled; UART0 pins are used for sensor chip-selects.
  */
 #pragma once
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include "esp_err.h"
 
-void usb_start(void);   /* install driver, print banner, spawn command task */
+esp_err_t usb_start(void); /* install driver and spawn command task */
 
 /* Thread-safe writes (safe to call from capture task too). */
-void usb_send(const void *data, size_t len);
+bool usb_send(const void *data, size_t len);
 int  usb_printf(const char *fmt, ...);
