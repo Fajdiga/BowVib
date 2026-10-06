@@ -7,6 +7,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
@@ -77,10 +78,10 @@ static void status(void)
         pos += (size_t)n;
     }
     usb_printf("STATUS running=%d sensors=4 present_mask=%02X present=%s whoami=%s "
-               "odr_hz=%u fs_g=%u fifo=%s spi_hz=10000000 freq_fine=%s\n",
+               "odr_hz=%u fs_g=%u fifo=%s spi_hz=%u freq_fine=%s\n",
                capture_running() ? 1 : 0, mask, names, ids,
                LSM6DSV320X_ODR_HZ, LSM6DSV320X_FS_G,
-               capture_running() ? "streaming" : "idle", freq_fine);
+               capture_running() ? "streaming" : "idle", LSM6DSV320X_SPI_HZ, freq_fine);
 }
 
 static void handle_line_unlocked(char *line)
@@ -101,6 +102,14 @@ static void handle_line_unlocked(char *line)
     }
     if (!strcmp(cmd, "STATUS")) {
         status();
+    } else if (!strcmp(cmd, "TIMINGTEST") || !strcmp(cmd, "DIRECTTEST")) {
+        const char *arg = strtok(NULL, " \t");
+        char *end = NULL;
+        unsigned long seconds = arg ? strtoul(arg, &end, 10) : 120;
+        bool ok = (!arg || (end && !*end)) && seconds >= 1 && seconds <= 600 &&
+                  (!strcmp(cmd, "DIRECTTEST") ? capture_start_direct_test((uint32_t)seconds) :
+                                                capture_start_timing_test((uint32_t)seconds));
+        usb_printf("%s\n", ok ? "TIMING START" : "ERR timing_test_seconds_1_to_600_or_busy");
     } else if (!strcmp(cmd, "SCAN")) {
         if (capture_running()) {
             usb_printf("ERR busy\n");
@@ -149,6 +158,8 @@ static void handle_line_unlocked(char *line)
         usb_printf("START streams detected HG FIFO channels A-D, 7680 Hz, +/-320 g.\n");
         usb_printf("SCAN retries all four chip selects; LEDTEST flashes GPIO3,4,5.\n");
         usb_printf("CSATEST toggles CS_A/GPIO16 every second for 10 transitions.\n");
+        usb_printf("TIMINGTEST [seconds] checks hardware timestamps without flash writes (default 120).\n");
+        usb_printf("DIRECTTEST [seconds] checks INT1 direct reads without flash writes (default 120).\n");
     } else {
         usb_printf("ERR unknown command\n");
     }

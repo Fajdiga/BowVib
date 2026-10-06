@@ -2,9 +2,11 @@
 
 ## On-board shot recording
 
-The firmware now also stores triggered shots in the ESP32-C6's internal flash. The unified phone page defaults to a **50 g** pulse trigger with **10 s before + 3 s after**. An early pulse keeps the available history; with no pulse, acquisition continues until flash capacity and the full session is saved. The 8 MiB flash holds a 1 MiB firmware partition and a **6.9375 MiB recording partition**; a small reserve accommodates FIFO draining. Duration depends on sensor count, actual rates and frame overhead. A pulse near capacity can have an incomplete post-window, flagged for review. Pre/post settings and threshold can be changed in the page or `shot_tool.py`. Flash is erased before acquisition. A completed shot survives reset and must be explicitly deleted before the next shot. Existing live capture modes remain available.
+The firmware now also stores triggered shots in the ESP32-C6's internal flash. The unified phone page defaults to a **50 g** pulse trigger with **10 s before + 3 s after**. An early pulse keeps the available history; with no pulse, acquisition continues until flash capacity and the full session is saved. The 8 MiB flash holds a 1 MiB firmware partition and a **6.9375 MiB recording partition**; a small reserve accommodates the final RAM queue. Duration depends on sensor count, actual rates and frame overhead. A pulse near capacity can have an incomplete post-window, flagged for review. Pre/post settings and threshold can be changed in the page or `shot_tool.py`. Flash is erased before acquisition. A completed shot survives reset and must be explicitly deleted before the next shot. Existing live capture modes remain available.
 
 The expanded layout moves recording storage from `0x210000` to `0x110000`. Download any saved BVR before installing this partition table: existing recordings require migration and are not preserved by simply flashing the new layout. The current firmware fits in 1 MiB; future builds must also pass the partition size check.
+
+New standalone recordings read XYZ at 10 MHz SPI directly on each sensor INT1 data-ready interrupt. Each sample retains its original ESP32 interrupt timestamp; the FIFO is bypassed. All sensor traces retain that common time axis, including real differences in pulse arrival; their sample edges remain independent. Timing diagnostics appear in the phone plot and exported metadata. Older recordings remain readable. See [timing and characterization](docs/synchronization.md).
 
 ```powershell
 python shot_tool.py --port COM92 arm --pre 10 --post 3
@@ -33,7 +35,7 @@ The H8 module provides 8 MB flash and no PSRAM. Wi-Fi capture uses a 32 KiB Free
 | LED1-LED3 | 3, 4, 5 |
 | USB D- / D+ | 12 / 13 |
 
-GPIO16/17 are also UART0 TX/RX. UART console output is disabled so it cannot toggle those chip-select pins or corrupt the USB binary stream. FIFO draining uses polling; the interrupt pins are not required for acquisition. IMU A-D correspond to `present_mask` bits 0-3 and are also called IMU 1-4.
+GPIO16/17 are also UART0 TX/RX. UART console output is disabled so it cannot toggle those chip-select pins or corrupt the USB binary stream. Standalone recording requires sensor INT1 A-D on GPIO20, 21, 22 and 23 respectively, confirmed by the user. Live FIFO streaming still uses polling. IMU A-D correspond to `present_mask` bits 0-3 and are also called IMU 1-4.
 
 ## Capture
 
@@ -78,7 +80,7 @@ The ESP32-C6 starts a local WPA2 access point, a browser page, and a TCP capture
 
 The ESP32 serves the complete page and records into internal flash. Recording continues if the browser disconnects, and the saved recording survives power-off. The browser validates the downloaded recording and creates its NPZ and zoomable XYZ plot locally. One recording fits on the board at a time; it is never automatically overwritten.
 
-New automatic recordings retain the triggering sensor and sample index. The first observed sample at or above the threshold becomes time zero in plots and exports, removing the late marker caused by FIFO/task processing delay. Timing between independent sensors remains estimated. The updated browser and `shot_tool.py` read both legacy BVR v1 and new v2 recordings; older recordings retain their original software trigger time. Flash the updated application to enable the new recorder and interface.
+New automatic recordings retain the triggering sensor and sample index. The first observed sample at or above the threshold becomes time zero in plots and exports, removing the late marker caused by FIFO/task processing delay. Each channel keeps its native sampling times on the common ESP32 clock; interrupt latency and physical pulse skew still require characterization. The updated browser and `shot_tool.py` read BVR versions 1 through 5; older recordings retain their original software trigger time. Flash the updated application to enable the new recorder and interface.
 
 The phone page checks manifest/page CRCs, page order, timestamps and per-sensor sample continuity. Quality and saturation warnings are shown beside the plot; flagged raw data remains downloadable for diagnosis. Phone archives retain little-endian signed `int16` channels in an uncompressed NPZ ZIP; Python archives use `int32` channels and compression. Both open in `inspect_raw.py` and preserve full channel counts. The phone archive includes per-sensor estimated time arrays and recording metadata. It omits the redundant common-length `samples_lsb` array; the inspector constructs it on load.
 

@@ -44,7 +44,7 @@ esp_err_t shot_store_init(void)
     esp_err_t err = esp_partition_read(s_partition, 0, &s_manifest, sizeof(s_manifest));
     if (err != ESP_OK) return err;
     s_saved = !memcmp(s_manifest.magic, "BVR1", 4) &&
-        (s_manifest.version == 1 || s_manifest.version == 2) &&
+        (s_manifest.version >= 1 && s_manifest.version <= 5) &&
         s_manifest.page_count == s_pages && s_manifest.end_seq >= s_manifest.first_seq &&
         s_manifest.end_seq - s_manifest.first_seq <= s_pages &&
         s_manifest.ended_us >= s_manifest.started_us &&
@@ -75,7 +75,7 @@ esp_err_t shot_store_begin(uint32_t pre_ms, uint32_t post_ms, const char *metada
     if (err != ESP_OK) return err;
     memset(&s_manifest, 0, sizeof(s_manifest));
     memcpy(s_manifest.magic, "BVR1", 4);
-    s_manifest.version = 2;
+    s_manifest.version = 5;
     s_manifest.page_count = s_pages;
     s_manifest.pre_ms = pre_ms; s_manifest.post_ms = post_ms;
     s_manifest.odr_hz = LSM6DSV320X_ODR_HZ; s_manifest.fs_g = LSM6DSV320X_FS_G;
@@ -124,6 +124,23 @@ esp_err_t shot_store_append(const uint8_t *frame, size_t len, uint64_t time_us, 
     memcpy(s_page + h->used + 12, frame, len);
     h->used += 12 + len;
     return ESP_OK;
+}
+
+esp_err_t shot_store_timestamp(uint64_t drain_us, uint8_t sensor, uint32_t index, uint32_t ticks)
+{
+    uint8_t event[11] = {'I', 'M', '4', 'H', sensor, 0, 0};
+    memcpy(event + 7, &ticks, 4);
+    return shot_store_append(event, sizeof(event), drain_us, index);
+}
+
+esp_err_t shot_store_clock(uint64_t drain_us, uint8_t sensor, uint32_t ticks,
+                          uint64_t midpoint_us, uint32_t span_us)
+{
+    uint8_t event[23] = {'I', 'M', '4', 'C', sensor, 0, 0};
+    memcpy(event + 7, &ticks, 4);
+    memcpy(event + 11, &midpoint_us, 8);
+    memcpy(event + 19, &span_us, 4);
+    return shot_store_append(event, sizeof(event), drain_us, 0);
 }
 
 esp_err_t shot_store_mark_trigger(uint64_t time_us, uint8_t sensor,

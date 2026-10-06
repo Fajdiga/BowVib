@@ -21,6 +21,66 @@ PAGE_BYTES = 4096
 SENSITIVITY_G = 0.010417
 
 
+def hardware_time_fit(anchors, clocks, origin_us, indices, dense=False):
+    """Map sample index -> FIFO ticks -> common host time, independently of drains."""
+    if not anchors or len(clocks) < 2:
+        raise ValueError("Missing hardware timestamp or clock calibration records")
+    x, y = np.asarray(anchors, dtype=float).T
+    if len(x) > 1 and (np.any(np.diff(x) <= 0) or np.any(np.diff(y) <= 0) or
+                      np.any(np.diff(y) - 6 * np.diff(x) < -2)):
+        raise ValueError("Inconsistent hardware timestamp/sample sequence")
+    tick_slope = 6.0
+    if len(x) > 1:
+        dx = x - x.mean()
+        tick_slope = float(np.dot(dx, y - y.mean()) / np.dot(dx, dx))
+    tick_intercept = float(np.mean(y - tick_slope * x))
+    intervals = np.diff(y) - 6 * np.diff(x)
+    fifo_error = float(np.max(np.abs(intervals))) if len(intervals) else 0.0
+    discontinuities = int(np.count_nonzero(np.abs(intervals) > 2))
+    minimum_span = min(c[2] for c in clocks)
+    good = [c for c in clocks if c[2] <= minimum_span + 50]
+    if len(good) < 2:
+        raise ValueError("Insufficient short-bracket clock calibration records")
+    cx = np.asarray([c[0] for c in good], dtype=float)
+    cy = np.asarray([(c[1] - origin_us) / 1e6 for c in good])
+    if np.any(np.diff(cx) <= 0) or np.any(np.diff(cy) <= 0):
+        raise ValueError("Non-monotonic sensor clock calibration")
+    weights = 1 / np.maximum(np.asarray([c[2] for c in good], dtype=float), 1) ** 2
+    mx, my = np.average(cx, weights=weights), np.average(cy, weights=weights)
+    dx = cx - mx
+    clock_slope = float(np.sum(weights * dx * (cy - my)) / np.sum(weights * dx * dx))
+    if not 1 / (46080 * 1.2) < clock_slope < 1 / (46080 * .8):
+        raise ValueError("Implausible sensor timestamp clock rate")
+    clock_intercept = float(my - clock_slope * mx)
+    residuals = cy - (clock_intercept + clock_slope * cx)
+    max_error_us = float(np.max(np.abs(residuals)) * 1e6)
+    local_error_us = 0.0
+    # Characterize local curvature with each interior calibration left out.
+    if len(cx) > 2:
+        predicted_middle = cy[:-2] + (cx[1:-1] - cx[:-2]) * (cy[2:] - cy[:-2]) / (cx[2:] - cx[:-2])
+        local_error_us = float(np.max(np.abs(cy[1:-1] - predicted_middle)) * 1e6)
+    uncertainty_us = local_error_us + max(c[2] for c in good) / 2 + clock_slope * 1e6 * (1 + (0 if dense else fifo_error))
+    slope = tick_slope * clock_slope
+    intercept = clock_intercept + tick_intercept * clock_slope
+    diagnostic = dict(clock_samples=len(good), fifo_timestamp_count=len(anchors),
+                      clock_tick_us=clock_slope * 1e6,
+                      clock_fit_rms_us=float(np.sqrt(np.mean(residuals ** 2)) * 1e6),
+                      clock_fit_max_us=max_error_us, fifo_fit_max_ticks=fifo_error,
+                      clock_interpolation_max_us=local_error_us,
+                      estimated_timing_uncertainty_us=uncertainty_us, sample_period_us=slope * 1e6,
+                      timestamp_discontinuities=discontinuities)
+    # Interpolate locally so an occasional extra time slot is not smeared over
+    # the entire capture. Its exact position within the 32-row interval is unknown.
+    indices = indices.astype(np.float64)
+    ticks = np.interp(indices, x, y)
+    ticks = np.where(indices < x[0], y[0] + 6 * (indices - x[0]), ticks)
+    ticks = np.where(indices > x[-1], y[-1] + 6 * (indices - x[-1]), ticks)
+    time_axis = np.interp(ticks, cx, cy)
+    time_axis = np.where(ticks < cx[0], cy[0] + (ticks - cx[0]) * clock_slope, time_axis)
+    time_axis = np.where(ticks > cx[-1], cy[-1] + (ticks - cx[-1]) * clock_slope, time_axis)
+    return slope, intercept, diagnostic, time_axis
+
+
 @dataclass
 class Shot:
     metadata: dict
@@ -28,6 +88,7 @@ class Shot:
     times: list[np.ndarray]
     drain_times: list[np.ndarray]
     indices: list[np.ndarray]
+    sensor_ticks: list[np.ndarray | None] | None = None
 
 
 def read_shot(path: Path) -> Shot:
@@ -40,7 +101,7 @@ def read_shot(path: Path) -> Shot:
         magic, version, first, end, capacity, pre, post, rate, fs, present, quality, saturation = fields[:12]
         started, trigger, ended, shot_id = fields[12:16]
         trims, raw_metadata, crc = fields[16:20], fields[20], fields[21]
-        if magic != b"BVR1" or version not in (1, 2) or zlib.crc32(header[:-4]) != crc:
+        if magic != b"BVR1" or version not in (1, 2, 3, 4, 5) or zlib.crc32(header[:-4]) != crc:
             raise ValueError("Invalid manifest or CRC")
         if not (0 <= first < end and 0 < end - first <= capacity <= 2048):
             raise ValueError("Invalid page range")
@@ -53,12 +114,13 @@ def read_shot(path: Path) -> Shot:
             test_metadata = json.loads(metadata_text)
         except json.JSONDecodeError:
             test_metadata = {"raw_text": metadata_text}
-        metadata = dict(id=shot_id.hex(), pre_ms=pre, post_ms=post, odr_hz=rate,
+        metadata = dict(id=shot_id.hex(), format_version=version, pre_ms=pre, post_ms=post, odr_hz=rate,
                         fs_g=fs, present_mask=present, quality_mask=quality,
                         saturation_mask=saturation, started_us=started,
                         trigger_us=trigger, triggered=bool(trigger), ended_us=ended, freq_fine=list(trims),
                         test=test_metadata, timing="Estimated by fitting software FIFO drain timestamps to sample indices; no verified hardware sync")
-        trigger_info = {"kind": "manual"} if version == 2 and trigger else None
+        trigger_info = {"kind": "manual"} if version >= 2 and trigger else None
+        anchors, clocks = [[] for _ in range(4)], [[] for _ in range(4)]
         chunks, indices, drains = [[] for _ in range(4)], [[] for _ in range(4)], [[] for _ in range(4)]
         next_index = [None] * 4
         last_data_record = None
@@ -82,8 +144,22 @@ def read_shot(path: Path) -> Shot:
                 drain, index, frame, sensor, rows = struct.unpack_from("<QI4sBH", page, offset)
                 if not first_us <= drain <= last_us or (record_times and drain < record_times[-1]):
                     raise ValueError("Non-monotonic sample timestamps")
+                if frame in (b"IM4H", b"IM4C"):
+                    length = 23 if frame == b"IM4H" else 35
+                    if version not in (3, 4) or (frame == b"IM4H" and version != 3) or rows or sensor >= 4 or not present & (1 << sensor) or offset + length > used:
+                        raise ValueError("Invalid hardware timing record")
+                    ticks = struct.unpack_from("<I", page, offset + 19)[0]
+                    if frame == b"IM4H":
+                        anchors[sensor].append((index, ticks))
+                    else:
+                        midpoint, span = struct.unpack_from("<QI", page, offset + 23)
+                        if index or not started <= midpoint <= drain or not 0 < span <= 1000000:
+                            raise ValueError("Invalid clock calibration bracket")
+                        clocks[sensor].append((ticks, midpoint, span))
+                    record_times.append(drain); offset += length
+                    continue
                 if frame == b"IM4T":
-                    if version != 2 or not trigger or rows or sensor >= 4 or not present & (1 << sensor) or offset + 23 > used or trigger_info["kind"] != "manual":
+                    if version < 2 or not trigger or rows or sensor >= 4 or not present & (1 << sensor) or offset + 23 > used or trigger_info["kind"] != "manual":
                         raise ValueError("Invalid threshold trigger record")
                     threshold = struct.unpack_from("<I", page, offset + 19)[0]
                     if not 20 <= threshold <= 320000:
@@ -93,14 +169,28 @@ def read_shot(path: Path) -> Shot:
                     trigger_info = dict(kind="threshold", sensor=sensor, index=index, thresholdMg=threshold)
                     record_times.append(drain); offset += 23
                     continue
-                length = 19 + rows * 6
-                if frame != b"IM4D" or sensor >= 4 or not present & (1 << sensor) or not 1 <= rows <= 256 or offset + length > used:
+                timed = frame == b"IM4S" and version >= 4
+                length = 23 + rows * 7 if timed else 19 + rows * 6
+                if (not timed and (frame != b"IM4D" or version >= 4)) or sensor >= 4 or not present & (1 << sensor) or not 1 <= rows <= 256 or offset + length > used:
                     raise ValueError("Invalid sample frame")
                 if next_index[sensor] is not None and index != next_index[sensor]:
                     raise ValueError("Discontinuous per-sensor sample sequence")
                 next_index[sensor] = index + rows
                 last_data_record = (sensor, index, rows, drain)
-                raw = np.frombuffer(page, dtype="<i2", count=rows * 3, offset=offset + 19).reshape(-1, 3).copy()
+                if timed:
+                    packed = np.frombuffer(page, dtype=np.uint8, count=rows * 7, offset=offset + 23).reshape(-1, 7)
+                    deltas = packed[:, 6].astype(np.uint64)
+                    if deltas[0] or np.any(deltas[1:] == 0):
+                        raise ValueError("Invalid per-sample timestamp delta")
+                    ticks = struct.unpack_from('<I', page, offset + 19)[0] + np.cumsum(deltas)
+                    if ticks[-1] > 0xffffffff:
+                        raise ValueError("Sensor timestamp rollover")
+                    if version == 5 and ticks[-1] > drain - started:
+                        raise ValueError("Sample time is after its storage time")
+                    anchors[sensor].extend(zip(range(index, index + rows), ticks.tolist()))
+                    raw = packed[:, :6].copy().view('<i2').reshape(-1, 3)
+                else:
+                    raw = np.frombuffer(page, dtype="<i2", count=rows * 3, offset=offset + 19).reshape(-1, 3).copy()
                 chunks[sensor].append(raw)
                 indices[sensor].append(np.arange(index, index + rows, dtype=np.uint64))
                 drains[sensor].append(np.full(rows, (drain - (trigger or started)) / 1e6))
@@ -110,9 +200,10 @@ def read_shot(path: Path) -> Shot:
             last_page_time = last_us
         if source.read(1):
             raise ValueError("Unexpected data after final page")
-    arrays, times, kept_drains, kept_indices = [], [], [], []
+    arrays, times, kept_drains, kept_indices, kept_ticks = [], [], [], [], []
     fitted, full_values, full_indices, full_drains = [], [], [], []
-    warnings, fitted_rates, timing_residuals = [], [], []
+    warnings, fitted_rates, timing_residuals, timing_diagnostics = [], [], [], []
+    hardware_axes = [None] * 4
     for sensor in range(4):
         values = np.concatenate(chunks[sensor]) if chunks[sensor] else np.empty((0, 3), dtype=np.int16)
         idx = np.concatenate(indices[sensor]) if indices[sensor] else np.empty(0, dtype=np.uint64)
@@ -121,7 +212,39 @@ def read_shot(path: Path) -> Shot:
         predicted = rate * (1 if trim == -128 else 1 + trim * 0.0013)
         estimated_rate, residual = predicted, None
         slope, intercept = 1 / predicted, (started - (trigger or started)) / 1e6
-        if len(idx) >= 2:
+        diagnostic = None
+        if version == 5 and present & (1 << sensor):
+            native = np.asarray([a[1] for a in anchors[sensor]], dtype=np.float64)
+            if len(native) != len(idx) or not len(native) or np.any(np.diff(native) <= 0):
+                raise ValueError("Missing or non-monotonic direct sample timestamps")
+            intervals = np.diff(native)
+            hardware_axes[sensor] = (native + started - (trigger or started)) / 1e6
+            slope = (native[-1] - native[0]) / (len(native) - 1) / 1e6 if len(native) > 1 else slope
+            estimated_rate = 1 / slope
+            discontinuities = int(np.count_nonzero(intervals > 200))
+            diagnostic = dict(timestamp_source="ESP32 data-ready ISR", timestamp_count=len(native),
+                              timer_resolution_us=1, sample_period_us=slope * 1e6,
+                              min_interval_us=float(intervals.min()) if len(intervals) else None,
+                              max_interval_us=float(intervals.max()) if len(intervals) else None,
+                              timestamp_discontinuities=discontinuities)
+            if discontinuities:
+                warnings.append(f"Sensor {sensor + 1}: {discontinuities} data-ready intervals exceed 200 us; review possible missing sample")
+            if not .8 * rate < estimated_rate < 1.2 * rate:
+                warnings.append(f"Sensor {sensor + 1}: estimated rate outside plausible range")
+        elif version >= 3 and present & (1 << sensor):
+            if not len(idx):
+                raise ValueError("Missing hardware-timed samples")
+            selected = [a for a in anchors[sensor] if int(idx[0]) <= a[0] <= int(idx[-1])]
+            if any(a[0] > int(idx[-1]) + 1 for a in anchors[sensor]):
+                raise ValueError("Hardware timestamp refers to missing sample")
+            slope, intercept, diagnostic, hardware_axes[sensor] = hardware_time_fit(selected, clocks[sensor], trigger or started, idx, dense=version == 4)
+            estimated_rate = 1 / slope
+            residual = diagnostic["clock_fit_rms_us"] / 1e6
+            if diagnostic["estimated_timing_uncertainty_us"] > 1000:
+                warnings.append(f"Sensor {sensor + 1}: hardware timing uncertainty exceeds 1 ms")
+            if diagnostic["timestamp_discontinuities"]:
+                warnings.append(f"Sensor {sensor + 1}: {diagnostic['timestamp_discontinuities']} hardware timestamp interval discontinuities; review possible missing sample/time slot")
+        elif len(idx) >= 2:
             # A FIFO drain timestamp belongs to the batch, not each sample.
             # Fit only batch endpoints, then use a median intercept to reduce latency outliers.
             ends = np.r_[np.diff(drain) != 0, True]
@@ -138,6 +261,7 @@ def read_shot(path: Path) -> Shot:
                     if not .8 * rate < estimated_rate < 1.2 * rate:
                         warnings.append(f"Sensor {sensor + 1}: estimated rate outside plausible range")
         fitted_rates.append(estimated_rate); timing_residuals.append(residual)
+        timing_diagnostics.append(diagnostic)
         fitted.append((slope, intercept))
         full_values.append(values); full_indices.append(idx); full_drains.append(drain)
     # The software trigger timestamp is only an estimate of the sensor clock.
@@ -150,22 +274,30 @@ def read_shot(path: Path) -> Shot:
         if not len(idx) or not int(idx[0]) <= index <= int(idx[-1]):
             raise ValueError("Threshold trigger sample is missing")
         slope, intercept = fitted[sensor]
-        alignment_shift = intercept + index * slope
+        alignment_shift = float(hardware_axes[sensor][index - int(idx[0])]) if version >= 3 else intercept + index * slope
         metadata["timing"] = "Zero is the recorded threshold sample; other sample times estimated by fitting software FIFO drain timestamps; no verified hardware sync"
     metadata["trigger_info"] = trigger_info
+    if version >= 3:
+        metadata["timing"] = "FIFO hardware timestamps mapped to the shared ESP32 clock; independent sample clocks; physical pulse skew unverified"
+        metadata["timing_diagnostics"] = timing_diagnostics
+    if version == 5:
+        metadata["timing"] = "Original ESP32 data-ready ISR timestamps; shared clock, independent sample edges; interrupt latency and physical pulse skew unverified"
     metadata["trigger_alignment_shift_s"] = alignment_shift
     window_start = -pre / 1000 if trigger else 0
     window_end = post / 1000 if trigger else (ended - started) / 1e6
     for sensor in range(4):
         values, idx, drain = full_values[sensor], full_indices[sensor], full_drains[sensor] - alignment_shift
         slope, intercept = fitted[sensor]
-        if trigger_info and trigger_info["kind"] == "threshold" and trigger_info["sensor"] == sensor:
+        if hardware_axes[sensor] is not None:
+            t = hardware_axes[sensor] - alignment_shift
+        elif trigger_info and trigger_info["kind"] == "threshold" and trigger_info["sensor"] == sensor:
             t = (idx.astype(np.float64) - trigger_info["index"]) * slope
         else:
             t = idx.astype(np.float64) * slope + (intercept - alignment_shift)
         # Timestamp quantization is 1 us; retain samples lying on a rounded boundary.
         keep = (t >= window_start - 1e-6) & (t <= window_end + 1e-6)
         values, t, idx, drain = values[keep], t[keep], idx[keep], drain[keep]
+        kept_ticks.append(np.asarray([a[1] for a in anchors[sensor]], dtype=np.uint32)[keep] if version >= 4 else None)
         arrays.append(values); times.append(t); kept_indices.append(idx); kept_drains.append(drain)
         if present & (1 << sensor):
             if len(t) < 2:
@@ -181,7 +313,7 @@ def read_shot(path: Path) -> Shot:
     metadata["sensor_counts"] = [len(a) for a in arrays]
     metadata["sensor_estimated_sample_rates_hz"] = fitted_rates
     metadata["sensor_timing_residual_std_s"] = timing_residuals
-    return Shot(metadata, arrays, times, kept_drains, kept_indices)
+    return Shot(metadata, arrays, times, kept_drains, kept_indices, kept_ticks)
 
 
 def load_calibration(path: Path | None) -> dict:
@@ -218,6 +350,9 @@ def export_shot(shot: Shot, directory: Path, calibration: dict, overwrite: bool 
     g_arrays = processed(shot, calibration)
     payload = {f"imu{i + 1}_samples_lsb": a for i, a in enumerate(shot.arrays)}
     payload.update({f"imu{i + 1}_time_s": t for i, t in enumerate(shot.times)})
+    if shot.sensor_ticks:
+        counter_name = "drdy_time_us" if shot.metadata.get("format_version") == 5 else "sensor_ticks"
+        payload.update({f"imu{i + 1}_{counter_name}": t for i, t in enumerate(shot.sensor_ticks) if t is not None})
     payload.update({f"imu{i + 1}_sample_indices": t for i, t in enumerate(shot.indices)})
     payload.update({f"imu{i + 1}_drain_time_s": t for i, t in enumerate(shot.drain_times)})
     payload.update({f"imu{i + 1}_processed_g": a for i, a in enumerate(g_arrays)})

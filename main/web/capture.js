@@ -138,7 +138,7 @@ async function loadRecording() {
     loaded = parsed; rawBlob = new Blob([bytes], {type:"application/octet-stream"});
     archiveBlob = format.shotArchive(parsed);
     fullStart = Math.min(...loaded.series.filter(s => s.count).map(s => s.start));
-    fullEnd = Math.max(...loaded.series.filter(s => s.count).map(s => s.start + (s.count - 1) / s.rate));
+    fullEnd = Math.max(...loaded.series.filter(s => s.count).map(s => sampleTime(s, s.count - 1)));
     if (!(fullEnd > fullStart)) throw Error("Recording has too few samples to plot.");
     for (let i = 0; i < 4; i++) {
       $("sensor" + i).disabled = !loaded.counts[i];
@@ -167,6 +167,13 @@ function valueAt(series, index, axis) {
   const x = series.view.getInt16(offset, true), y = series.view.getInt16(offset + 2, true), z = series.view.getInt16(offset + 4, true);
   return Math.hypot(x, y, z) * .010417;
 }
+function sampleTime(series, index) { return series.times ? series.times[index] : series.start + index / series.rate; }
+function sampleIndex(series, time) {
+  if (!series.times) return Math.max(0, Math.min(series.count, Math.ceil((time-series.start)*series.rate)));
+  let lo=0,hi=series.count;
+  while(lo<hi){const mid=(lo+hi)>>1;if(series.times[mid]<time)lo=mid+1;else hi=mid}
+  return lo;
+}
 function timeLabel(seconds, span = viewEnd - viewStart) {
   return span < .2 ? (seconds * 1000).toFixed(span < .01 ? 2 : 1) + " ms" : seconds.toFixed(span < 2 ? 3 : 2) + " s";
 }
@@ -190,8 +197,8 @@ function drawPlot() {
     const axis = panels === 1 ? 3 : panel, top = 32 + panel * panelHeight, bottom = top + panelHeight - 50;
     let lo = Infinity, hi = -Infinity;
     const traces = visible.map(s => {
-      const from = Math.max(0, Math.ceil((viewStart - s.start) * s.rate) - 1);
-      const to = Math.min(s.count, Math.floor((viewEnd - s.start) * s.rate) + 2);
+      const from = Math.max(0, sampleIndex(s, viewStart) - 1);
+      const to = Math.min(s.count, sampleIndex(s, viewEnd) + 2);
       const step = Math.max(1, Math.ceil((to - from) / (right - left))), points = [];
       // Preserve both extrema per pixel bucket: even a one-sample pulse stays visible.
       for (let i = from; i < to; i += step) {
@@ -203,7 +210,7 @@ function drawPlot() {
         }
         lo = Math.min(lo, min); hi = Math.max(hi, max);
         const indices = imin === imax ? [imin] : imin < imax ? [imin, imax] : [imax, imin];
-        for (const j of indices) points.push([s.start + j / s.rate, valueAt(s, j, axis)]);
+        for (const j of indices) points.push([sampleTime(s, j), valueAt(s, j, axis)]);
       }
       return {s, points};
     });
@@ -250,7 +257,7 @@ function drawPlot() {
       if (info?.kind === "threshold") {
         const s = visible.find(s => s.id === info.sensor);
         if (s) {
-          const index = Math.round(-s.start * s.rate);
+          const index = sampleIndex(s, 0);
           if (index >= 0 && index < s.count) {
             ctx.fillStyle = colors[s.id]; ctx.beginPath(); ctx.arc(xAt(0), yAt(valueAt(s, index, axis)), 3.5, 0, 2 * Math.PI); ctx.fill();
           }
@@ -283,6 +290,16 @@ function drawPlot() {
   $("plotSummary").textContent = info?.kind === "threshold" ?
     "Time zero: first recorded sample reaching " + info.thresholdMg / 1000 + " g on sensor " + "ABCD"[info.sensor] + "." :
     loaded.triggered ? (info?.kind === "manual" ? "Time zero: manual trigger." : "Time zero: stored trigger time (legacy recording).") : "Full session saved without a trigger.";
+  const timing = loaded.metadata.timing_diagnostics?.filter(Boolean);
+  if (timing?.length) {
+    if (loaded.metadata.format_version === 5) {
+      const largestInterval = Math.max(...timing.map(d=>d.max_interval_us));
+      $("plotSummary").textContent += ' Original data-ready times on the shared clock. Largest sample interval: ' + largestInterval.toFixed(0) + ' us. Sample edges remain independent; physical pulse skew needs a common-impact test.';
+    } else {
+      const uncertainty = Math.max(...timing.map(d=>d.estimated_timing_uncertainty_us));
+      $("plotSummary").textContent += ' Shared clock timing; estimated mapping uncertainty up to ' + uncertainty.toFixed(0) + ' us. Sample edges remain independent; physical pulse skew needs a common-impact test.';
+    }
+  }
   const room = Math.max(0, fullEnd - fullStart - span);
   $("pan").disabled = room < 1e-8;
   $("pan").value = room > 0 ? Math.round((viewStart - fullStart) / room * 1000) : 0;

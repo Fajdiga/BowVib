@@ -30,9 +30,12 @@ bool shot_store_corrupt(void);
 esp_err_t shot_store_delete(void);
 esp_err_t shot_store_begin(uint32_t pre_ms, uint32_t post_ms, const char *metadata);
 esp_err_t shot_store_append(const uint8_t *frame, size_t len, uint64_t time_us, uint32_t sample_index);
-/* BVR version 2: record the precise threshold sample after its IM4D frame. */
+/* Persist the precise threshold sample after its data frame (BVR v2-v4). */
 esp_err_t shot_store_mark_trigger(uint64_t time_us, uint8_t sensor,
                                   uint32_t sample_index, uint32_t threshold_mg);
+esp_err_t shot_store_timestamp(uint64_t drain_us, uint8_t sensor, uint32_t index, uint32_t ticks);
+esp_err_t shot_store_clock(uint64_t drain_us, uint8_t sensor, uint32_t ticks,
+                          uint64_t midpoint_us, uint32_t span_us);
 esp_err_t shot_store_finish(uint64_t started, uint64_t trigger, uint64_t ended,
                             uint8_t quality, uint8_t saturation, bool save_full_session);
 const shot_manifest_t *shot_store_manifest(void);

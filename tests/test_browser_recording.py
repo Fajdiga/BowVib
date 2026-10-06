@@ -140,6 +140,15 @@ vm.runInThisContext(fs.readFileSync(process.argv[2],'utf8'));
   // No-trigger sessions open at full length with event navigation unavailable.
   vm.runInThisContext('loaded.triggered=false; viewStart=fullStart; viewEnd=fullEnd; drawPlot()');
   assert(elements.focusEvent.disabled);assert.strictEqual(state().span,state().full);
+  // Hardware-timed traces can contain local gaps; draw and navigation use
+  // their saved sample times rather than rebuilding a uniform time axis.
+  const timed=vm.runInThisContext('loaded.series[0]');
+  const middle=Math.floor(timed.count/2);
+  timed.times=Float64Array.from({length:timed.count},(_,i)=>timed.start+i/timed.rate+(i>=middle?.005:0));
+  global.timedTrace=timed;
+  assert.strictEqual(vm.runInThisContext('sampleTime(timedTrace,timedTrace.count-1)'),timed.times.at(-1));
+  assert.strictEqual(vm.runInThisContext('sampleIndex(timedTrace,timedTrace.times[Math.floor(timedTrace.count/2)])'),middle);
+  vm.runInThisContext('drawPlot()');
   elements.preSeconds.value='10';elements.postSeconds.value='3';elements.thresholdG.value='50';elements.shotMetadata.value='{}';
   elements.record.onclick();for(let i=0;i<20;i++)await Promise.resolve();
   assert(lastCommand.url.includes('pre_ms=10000'));assert(lastCommand.url.includes('post_ms=3000'));assert(lastCommand.url.includes('threshold_mg=50000'));

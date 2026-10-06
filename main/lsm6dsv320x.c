@@ -3,6 +3,9 @@
 #include <string.h>
 #include "driver/gpio.h"
 #include "esp_rom_sys.h"
+#include "esp_timer.h"
+#include "soc/gpio_struct.h"
+#include "hal/spi_ll.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -13,12 +16,19 @@
 #define REG_COUNTER_BDR_REG1   0x0BU
 #define REG_WHO_AM_I           0x0FU
 #define REG_CTRL1              0x10U
+#define REG_CTRL2              0x11U
 #define REG_CTRL3              0x12U
+#define REG_CTRL4              0x13U
+#define REG_CTRL7              0x16U
 #define REG_FIFO_STATUS1       0x1BU
 #define REG_FIFO_STATUS2       0x1CU
 #define REG_CTRL1_XL_HG        0x4EU
 #define REG_INTERNAL_FREQ_FINE 0x4FU
 #define REG_FIFO_DATA_OUT_TAG  0x78U
+#define REG_TIMESTAMP0         0x40U
+#define REG_TIMESTAMP2         0x42U
+#define REG_FUNCTIONS_ENABLE   0x50U
+#define REG_HAODR_CFG          0x62U
 
 #define LSM6DSV320X_ID          0x73U
 #define FIFO_MODE_BYPASS        0x00U
@@ -33,11 +43,14 @@ static uint8_t s_overrun_mask;
 static uint8_t s_whoami[LSM6DSV320X_COUNT];
 static int8_t s_freq_fine[LSM6DSV320X_COUNT];
 static bool s_bus_initialized;
+static bool s_drdy_monitor;
+static bool s_direct_bus;
+static volatile uint32_t s_direct_read_max_us;
 static uint8_t DRAM_ATTR s_fifo_tx[1U + LSM6DSV320X_FIFO_ROWS_PER_READ * LSM6DSV320X_FIFO_WORD_BYTES];
 static uint8_t DRAM_ATTR s_fifo_rx[1U + LSM6DSV320X_FIFO_ROWS_PER_READ * LSM6DSV320X_FIFO_WORD_BYTES];
 
-static esp_err_t transfer(spi_device_handle_t device, const void *tx,
-                          void *rx, size_t bytes)
+static esp_err_t transfer_mask(spi_device_handle_t device, uint32_t cs_mask,
+                              const void *tx, void *rx, size_t bytes, int64_t *released_us)
 {
     if (!device) return ESP_ERR_INVALID_STATE;
     spi_transaction_t transaction = {
@@ -45,15 +58,44 @@ static esp_err_t transfer(spi_device_handle_t device, const void *tx,
         .tx_buffer = tx,
         .rx_buffer = rx,
     };
-    return spi_device_polling_transmit(device, &transaction);
+    esp_err_t err = spi_device_acquire_bus(device, portMAX_DELAY);
+    if (err != ESP_OK) return err;
+    GPIO.out_w1tc.val = cs_mask;
+    err = spi_device_polling_transmit(device, &transaction);
+    GPIO.out_w1ts.val = cs_mask;
+    if (released_us) *released_us = esp_timer_get_time();
+    spi_device_release_bus(device);
+    return err;
+}
+
+static esp_err_t transfer(spi_device_handle_t device, const void *tx, void *rx, size_t bytes)
+{
+    for (unsigned i = 0; i < LSM6DSV320X_COUNT; ++i)
+        if (device && device == s_devices[i])
+            return transfer_mask(device, 1U << s_cs_pins[i], tx, rx, bytes, NULL);
+    return ESP_ERR_INVALID_STATE;
+}
+
+/* Broadcast only write commands: simultaneous reads would contend on MISO. */
+static esp_err_t broadcast_write(uint8_t reg, uint8_t value, int64_t *released_us)
+{
+    uint32_t mask = 0;
+    spi_device_handle_t device = NULL;
+    for (unsigned i = 0; i < LSM6DSV320X_COUNT; ++i) {
+        if (!(s_present_mask & (1U << i))) continue;
+        mask |= 1U << s_cs_pins[i];
+        device = s_devices[i];
+    }
+    uint8_t tx[2] = {reg, value};
+    return transfer_mask(device, mask, tx, NULL, sizeof(tx), released_us);
 }
 
 static esp_err_t add_spi_device(unsigned imu)
 {
     spi_device_interface_config_t cfg = {
-        .clock_speed_hz = 10 * 1000 * 1000,
+        .clock_speed_hz = LSM6DSV320X_SPI_HZ,
         .mode = 3,
-        .spics_io_num = s_cs_pins[imu],
+        .spics_io_num = -1, /* GPIO CS permits atomic multi-sensor writes. */
         .queue_size = 1,
     };
     return spi_bus_add_device(LSM6DSV320X_SPI_HOST, &cfg, &s_devices[imu]);
@@ -79,9 +121,9 @@ static esp_err_t read_reg(unsigned imu, uint8_t reg, uint8_t *value)
 static esp_err_t read_burst(unsigned imu, uint8_t reg, uint8_t *dst,
                             size_t len)
 {
-    uint8_t tx[3] = {(uint8_t)(reg | 0x80U), 0, 0};
-    uint8_t rx[3] = {0};
-    if (len > 2U) {
+    uint8_t tx[5] = {(uint8_t)(reg | 0x80U), 0, 0, 0, 0};
+    uint8_t rx[5] = {0};
+    if (len > 4U) {
         return ESP_ERR_INVALID_SIZE;
     }
     esp_err_t err = transfer(s_devices[imu], tx, rx, len + 1U);
@@ -108,9 +150,14 @@ static esp_err_t setup_imu(unsigned imu)
     err = write_reg(imu, REG_CTRL3, 0x44U);
     if (err != ESP_OK) return err;
 
-    /* The HG channel requires the low-g accelerometer to be in HP or HA mode.
-       Keep low-g at 15 Hz in HP mode but do not batch it into the FIFO. */
-    err = write_reg(imu, REG_CTRL1, 0x03U);
+    /* Both low-g and the powered-down gyro must select HAODR together. */
+    err = write_reg(imu, REG_CTRL2, 0x10U);
+    if (err != ESP_OK) return err;
+    err = write_reg(imu, REG_HAODR_CFG, 0x00U); /* 7680 Hz HAODR selection. */
+    if (err != ESP_OK) return err;
+
+    /* HAODR mode also controls the HG sampling clock. Low-g remains unbatched. */
+    err = write_reg(imu, REG_CTRL1, 0x1CU);
     if (err != ESP_OK) return err;
 
     /* FIFO stores only tagged high-g XYZ words (7 bytes per sample). */
@@ -178,8 +225,7 @@ esp_err_t lsm6dsv320x_cs_a_test(unsigned transitions, uint32_t interval_ms)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* GPIO16 is normally driven by the SPI peripheral as CS_A. Remove that
-       routing first so the measured pin is controlled directly by the GPIO. */
+    /* Suspend sensor A's SPI handle while its GPIO CS runs the pin test. */
     esp_err_t err = spi_bus_remove_device(s_devices[0]);
     if (err != ESP_OK) return err;
     s_devices[0] = NULL;
@@ -204,8 +250,8 @@ esp_err_t lsm6dsv320x_cs_a_test(unsigned transitions, uint32_t interval_ms)
         gpio_set_level((gpio_num_t)s_cs_pins[0], 1);
     }
 
-    /* Return GPIO16 to hardware-CS control and attempt to identify/configure A. */
-    gpio_reset_pin((gpio_num_t)s_cs_pins[0]);
+    /* Restore the manually controlled CS and identify/configure A. */
+    gpio_set_level((gpio_num_t)s_cs_pins[0], 1);
     esp_err_t restore_err = add_spi_device(0);
     if (restore_err != ESP_OK) return restore_err;
     const esp_err_t sensor_err = setup_imu(0);
@@ -264,35 +310,152 @@ uint16_t lsm6dsv320x_fifo_level(unsigned imu)
 bool lsm6dsv320x_fifo_overrun(unsigned imu)
 {
     if (imu < LSM6DSV320X_COUNT) {
-        uint8_t status = 0;
-        if (read_reg(imu, REG_FIFO_STATUS2, &status) != ESP_OK ||
-            (status & (FIFO_OVR_IA | FIFO_OVR_LATCHED))) {
-            s_overrun_mask |= (uint8_t)(1U << imu);
-        }
+        /* fifo_level already reads STATUS1 then STATUS2 and latches overruns.
+           Reading STATUS2 alone violates the BDU ordering requirement. */
         return (s_overrun_mask & (1U << imu)) != 0;
     }
     return true;
 }
 
-void lsm6dsv320x_capture_start(void)
+esp_err_t lsm6dsv320x_capture_start(bool timestamps, int64_t *started_us)
 {
     s_overrun_mask = 0;
+    esp_err_t err = ESP_OK;
+    /* AN6119: at least 500 us after powering all HAODR sensors down. */
+    esp_rom_delay_us(600);
     for (unsigned i = 0; i < LSM6DSV320X_COUNT; ++i) {
         if (!(s_present_mask & (1U << i))) continue;
-        (void)write_reg(i, REG_FIFO_CTRL4, FIFO_MODE_BYPASS);
+        err = write_reg(i, REG_FIFO_CTRL4, FIFO_MODE_BYPASS);
+        if (err != ESP_OK) goto failed;
         /* FIFO_OVR_LATCHED clears on read. Discard only the previous capture's
            status while batching is disabled, before any new samples enter. */
         uint8_t status[2];
-        (void)read_burst(i, REG_FIFO_STATUS1, status, sizeof(status));
-        (void)write_reg(i, REG_CTRL1, 0x03U);
-        (void)write_reg(i, REG_CTRL1_XL_HG, 0x3CU);
+        err = read_burst(i, REG_FIFO_STATUS1, status, sizeof(status));
+        if (err != ESP_OK) goto failed;
+        err = write_reg(i, REG_CTRL1, 0x1CU);
+        if (err != ESP_OK) goto failed;
+        /* Only the direct path consumes register outputs. FIFO timing audits
+           route DRDY but leave register output disabled, as in FIFO captures. */
+        err = write_reg(i, REG_CTRL1_XL_HG, s_drdy_monitor && !timestamps ? 0xBCU : 0x3CU);
+        if (err != ESP_OK) goto failed;
+        err = write_reg(i, REG_FUNCTIONS_ENABLE, timestamps ? 0x40U : 0U);
+        if (err != ESP_OK) goto failed;
     }
-    esp_rom_delay_us(5000);
+    /* With gyro off, HAODR frequency settles after 70 ms (AN6119 3.4). */
+    esp_rom_delay_us(75000);
+    if (timestamps) {
+        err = broadcast_write(REG_TIMESTAMP2, 0xAAU, NULL);
+        if (err != ESP_OK) goto failed;
+        /* AN6119 requires 400 us before another write after timestamp reset. */
+        esp_rom_delay_us(400);
+    }
+    /* Timestamp every time slot: pair each HG word with its original clock. */
+    const uint8_t fifo_config = FIFO_MODE_CONTINUOUS | (timestamps ? 0x40U : 0U);
+    err = broadcast_write(REG_FIFO_CTRL4, fifo_config, started_us);
+    if (err != ESP_OK) goto failed;
     for (unsigned i = 0; i < LSM6DSV320X_COUNT; ++i) {
         if (!(s_present_mask & (1U << i))) continue;
-        (void)write_reg(i, REG_FIFO_CTRL4, FIFO_MODE_CONTINUOUS);
+        uint8_t actual;
+        err = read_reg(i, REG_FIFO_CTRL4, &actual);
+        if (err != ESP_OK) goto failed;
+        if (actual != fifo_config) { err = ESP_ERR_INVALID_RESPONSE; goto failed; }
+        err = read_reg(i, REG_CTRL1, &actual);
+        if (err != ESP_OK) goto failed;
+        if (actual != 0x1CU) { err = ESP_ERR_INVALID_RESPONSE; goto failed; }
+    }
+    return ESP_OK;
+failed:
+    lsm6dsv320x_capture_stop();
+    lsm6dsv320x_capture_finish();
+    return err;
+}
+
+esp_err_t lsm6dsv320x_clock_read(unsigned imu, uint32_t *ticks,
+                               int64_t *midpoint_us, uint32_t *span_us)
+{
+    uint8_t data[4];
+    const int64_t before = esp_timer_get_time();
+    esp_err_t err = read_burst(imu, REG_TIMESTAMP0, data, sizeof(data));
+    const int64_t after = esp_timer_get_time();
+    if (err != ESP_OK) return err;
+    memcpy(ticks, data, sizeof(*ticks));
+    *midpoint_us = before + (after - before) / 2;
+    *span_us = (uint32_t)(after - before);
+    return ESP_OK;
+}
+
+esp_err_t lsm6dsv320x_drdy_monitor(bool enabled)
+{
+    s_drdy_monitor = enabled;
+    for (unsigned i = 0; i < LSM6DSV320X_COUNT; ++i) {
+        if (!(s_present_mask & (1U << i))) continue;
+        esp_err_t err = write_reg(i, REG_CTRL4, enabled ? 0x02U : 0U);
+        if (err == ESP_OK) err = write_reg(i, REG_CTRL7, enabled ? 0x80U : 0U);
+        if (err != ESP_OK) return err;
+    }
+    return ESP_OK;
+}
+
+esp_err_t lsm6dsv320x_direct_start(int64_t *started_us)
+{
+    esp_err_t err = lsm6dsv320x_drdy_monitor(true);
+    if (err == ESP_OK) err = lsm6dsv320x_capture_start(false, started_us);
+    if (err == ESP_OK) err = broadcast_write(REG_FIFO_CTRL4, FIFO_MODE_BYPASS, started_us);
+    if (err != ESP_OK) return err;
+    err = spi_device_acquire_bus(s_devices[0], portMAX_DELAY);
+    if (err != ESP_OK) return err;
+    s_direct_bus = true;
+    /* Configure the fixed 7-byte read using the normal driver, before the ISR
+       owns SPI2. IRQ reads then use its 64-byte register buffer, without DMA. */
+    uint8_t tx[8] = {0xB4U}, rx[8];
+    spi_transaction_t t = {.length = 56U, .tx_buffer = tx, .rx_buffer = rx};
+    GPIO.out_w1tc.val = 1U << 16;
+    err = spi_device_polling_transmit(s_devices[0], &t);
+    GPIO.out_w1ts.val = 1U << 16;
+    if (err != ESP_OK) { lsm6dsv320x_direct_release(); return err; }
+    spi_dev_t *hw = SPI_LL_GET_HW(LSM6DSV320X_SPI_HOST);
+    spi_ll_dma_tx_enable(hw, false); spi_ll_dma_rx_enable(hw, false);
+    spi_ll_set_mosi_bitlen(hw, 56U); spi_ll_set_miso_bitlen(hw, 56U);
+    spi_ll_apply_config(hw);
+    s_direct_read_max_us = 0;
+    return ESP_OK;
+}
+
+void lsm6dsv320x_direct_release(void)
+{
+    if (s_direct_bus) {
+        spi_device_release_bus(s_devices[0]);
+        s_direct_bus = false;
     }
 }
+
+bool IRAM_ATTR lsm6dsv320x_direct_read_isr(unsigned imu, int16_t xyz[3])
+{
+    spi_dev_t *hw = SPI_LL_GET_HW(LSM6DSV320X_SPI_HOST);
+    const int64_t before = esp_timer_get_time();
+    const uint32_t cs = 1U << (16U + imu);
+    hw->dma_int_clr.trans_done = 1;
+    hw->data_buf[0].buf = 0xB4U; hw->data_buf[1].buf = 0;
+    hw->cmd.update = 1;
+    while (hw->cmd.update)
+        if (esp_timer_get_time() - before > 40) return false;
+    GPIO.out_w1tc.val = cs;
+    spi_ll_user_start(hw);
+    while (!spi_ll_usr_is_done(hw)) {
+        if (esp_timer_get_time() - before > 40) {
+            GPIO.out_w1ts.val = cs;
+            return false;
+        }
+    }
+    GPIO.out_w1ts.val = cs;
+    const uint64_t raw = (uint64_t)hw->data_buf[0].buf | ((uint64_t)hw->data_buf[1].buf << 32);
+    xyz[0] = (int16_t)(raw >> 8); xyz[1] = (int16_t)(raw >> 24); xyz[2] = (int16_t)(raw >> 40);
+    const uint32_t span = (uint32_t)(esp_timer_get_time() - before);
+    if (span > s_direct_read_max_us) s_direct_read_max_us = span;
+    return true;
+}
+
+uint32_t lsm6dsv320x_direct_read_max_us(void) { return s_direct_read_max_us; }
 
 void lsm6dsv320x_capture_stop(void)
 {
@@ -300,7 +463,7 @@ void lsm6dsv320x_capture_stop(void)
     for (unsigned i = 0; i < LSM6DSV320X_COUNT; ++i) {
         if (!(s_present_mask & (1U << i))) continue;
         (void)write_reg(i, REG_CTRL1_XL_HG, 0x04U); /* 320 g FS, ODR off */
-        (void)write_reg(i, REG_CTRL1, 0x00U);
+        (void)write_reg(i, REG_CTRL1, 0x10U); /* HAODR selected, ODR off. */
     }
 }
 

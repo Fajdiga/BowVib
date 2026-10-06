@@ -14,6 +14,7 @@ idf_component_register(
     REQUIRES
         esp_driver_gpio
         esp_driver_spi
+        esp_hal_gpspi
         esp_driver_usb_serial_jtag
         esp_event
         esp_http_server
