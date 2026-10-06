@@ -3,6 +3,8 @@
 #include "usb.h"
 #include "wifi_stream.h"
 #include "web_capture.h"
+#include "shot_store.h"
+#include "capture_timing.h"
 
 #include <string.h>
 #include "esp_timer.h"
@@ -15,6 +17,7 @@
 #define WORD_BYTES LSM6DSV320X_FIFO_WORD_BYTES
 #define SAMPLE_BYTES 6U
 #define FRAME_HEADER_BYTES 7U
+#define HIGH_G_SATURATION_COUNTS ((LSM6DSV320X_FS_G * 995000U) / 10417U)
 #define WIFI_TX_BUFFER_BYTES (32U * 1024U)
 /* Stay ahead of HTTP/TCP sends while draining; the 1 ms delay below gives
    command and network tasks regular time to run. */
@@ -38,6 +41,12 @@ static volatile uint8_t s_overrun_mask;
 static int64_t s_started_us;
 static uint8_t s_fifo_raw[CHUNK_ROWS * WORD_BYTES];
 static uint8_t s_frame[FRAME_HEADER_BYTES + CHUNK_ROWS * SAMPLE_BYTES];
+static volatile bool s_shot_output, s_trigger_requested;
+static volatile int64_t s_trigger_us;
+static uint32_t s_pre_ms, s_post_ms, s_threshold_mg;
+static uint8_t s_saturation_mask;
+static volatile esp_err_t s_shot_error;
+static bool s_save_full_session;
 
 static bool capture_send(const void *data, size_t len, TickType_t wait)
 {
@@ -83,7 +92,7 @@ static void wifi_tx_task(void *arg)
     }
 }
 
-static void send_data_frame(unsigned imu, const uint8_t *fifo, uint16_t rows)
+static void send_data_frame(unsigned imu, const uint8_t *fifo, uint16_t rows, uint16_t remaining_rows)
 {
     uint16_t kept = 0;
     s_frame[0] = 'I'; s_frame[1] = 'M'; s_frame[2] = '4'; s_frame[3] = 'D';
@@ -91,6 +100,7 @@ static void send_data_frame(unsigned imu, const uint8_t *fifo, uint16_t rows)
     for (uint16_t row = 0; row < rows; ++row) {
         const uint8_t *src = fifo + (size_t)row * WORD_BYTES;
         if ((src[0] & 0xF8U) != (0x1DU << 3)) {
+            if (s_shot_output) s_overrun_mask |= (uint8_t)(1U << imu);
             continue;
         }
         memcpy(s_frame + FRAME_HEADER_BYTES + (size_t)kept * SAMPLE_BYTES,
@@ -101,6 +111,43 @@ static void send_data_frame(unsigned imu, const uint8_t *fifo, uint16_t rows)
     s_frame[5] = (uint8_t)(kept & 0xFFU);
     s_frame[6] = (uint8_t)(kept >> 8);
     const size_t frame_len = FRAME_HEADER_BYTES + (size_t)kept * SAMPLE_BYTES;
+    if (s_shot_output) {
+        const int64_t now = esp_timer_get_time();
+        uint16_t trigger_row = UINT16_MAX;
+        for (uint16_t row = 0; row < kept; ++row) {
+            int16_t xyz[3];
+            memcpy(xyz, s_frame + FRAME_HEADER_BYTES + row * SAMPLE_BYTES, sizeof(xyz));
+            int64_t norm = 0;
+            for (unsigned axis = 0; axis < 3; ++axis) {
+                int32_t v = xyz[axis];
+                if (v >= (int32_t)HIGH_G_SATURATION_COUNTS || v <= -(int32_t)HIGH_G_SATURATION_COUNTS)
+                    s_saturation_mask |= (uint8_t)(1U << imu);
+                norm += (int64_t)v * v;
+            }
+            if (capture_threshold_reached((uint64_t)norm, s_threshold_mg) &&
+                !s_trigger_us && !s_stop_requested) {
+                /* Latch the first crossing sample while inspecting this FIFO
+                   batch; waiting for the next task iteration shifts the event
+                   after the pulse. Preserve its exact sample index below. */
+                s_trigger_us = capture_sample_time_us(s_started_us, now,
+                    kept - row - 1U + remaining_rows, LSM6DSV320X_ODR_HZ,
+                    lsm6dsv320x_internal_freq_fine(imu));
+                s_trigger_requested = false;
+                trigger_row = row;
+            }
+        }
+        esp_err_t err = shot_store_append(s_frame, frame_len, now, s_counts[imu]);
+        if (err == ESP_OK && trigger_row != UINT16_MAX) {
+            err = shot_store_mark_trigger(now, (uint8_t)imu,
+                s_counts[imu] + trigger_row, s_threshold_mg);
+        }
+        if (err != ESP_OK) {
+            s_shot_error = err; s_overrun_mask |= 0x80U; s_stop_requested = true;
+            return;
+        }
+        s_counts[imu] += kept;
+        return;
+    }
     if (!capture_send(s_frame, frame_len, 0)) return;
     s_counts[imu] += kept;
 }
@@ -140,10 +187,17 @@ static void capture_task(void *arg)
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
         }
-        if (s_duration_limit_us > 0 &&
+        if (s_duration_limit_us > 0 && !(s_shot_output && s_trigger_us) &&
             esp_timer_get_time() - s_started_us >= s_duration_limit_us) {
+            if (s_shot_output) s_save_full_session = true;
             s_stop_requested = true;
         }
+        if (s_shot_output && s_trigger_requested && !s_trigger_us && !s_stop_requested) {
+            s_trigger_us = esp_timer_get_time();
+            s_trigger_requested = false;
+        }
+        if (s_shot_output && s_trigger_us &&
+            esp_timer_get_time() - s_trigger_us >= (int64_t)s_post_ms * 1000) s_stop_requested = true;
         for (unsigned imu = 0; imu < LSM6DSV320X_COUNT; ++imu) {
             if (!(lsm6dsv320x_present_mask() & (1U << imu))) continue;
             uint16_t level = lsm6dsv320x_fifo_level(imu);
@@ -156,9 +210,14 @@ static void capture_task(void *arg)
                     s_overrun_mask |= (uint8_t)(1U << imu);
                     break;
                 }
-                send_data_frame(imu, s_fifo_raw, n);
+                send_data_frame(imu, s_fifo_raw, n, level - n);
                 level = (uint16_t)(level - n);
             }
+        }
+        if (s_shot_output && !s_stop_requested && shot_store_near_capacity()) {
+            if (!s_trigger_us) s_save_full_session = true;
+            else s_overrun_mask |= 0x40U; /* Capacity ended the post-window early. */
+            s_stop_requested = true;
         }
         if (s_stop_requested) {
             lsm6dsv320x_capture_stop();
@@ -168,13 +227,21 @@ static void capture_task(void *arg)
                 uint16_t level = lsm6dsv320x_fifo_level(imu);
                 while (level) {
                     const uint16_t n = level > CHUNK_ROWS ? CHUNK_ROWS : level;
-                    if (lsm6dsv320x_fifo_read(imu, s_fifo_raw, n) != ESP_OK) break;
-                    send_data_frame(imu, s_fifo_raw, n);
+                    if (lsm6dsv320x_fifo_read(imu, s_fifo_raw, n) != ESP_OK) {
+                        s_overrun_mask |= (uint8_t)(1U << imu);
+                        break;
+                    }
+                    send_data_frame(imu, s_fifo_raw, n, level - n);
                     level = (uint16_t)(level - n);
                 }
             }
             lsm6dsv320x_capture_finish();
-            send_end_frame();
+            if (s_shot_output) {
+                const esp_err_t err = shot_store_finish(s_started_us, s_trigger_us,
+                    esp_timer_get_time(), s_overrun_mask, s_saturation_mask, s_save_full_session);
+                if (err != ESP_OK) s_shot_error = err;
+                s_shot_output = false;
+            } else send_end_frame();
             s_stop_requested = false;
             s_running = false;
             continue;
@@ -266,9 +333,59 @@ bool capture_start_browser(void)
     return true;
 }
 
+bool capture_start_shot(uint32_t pre_ms, uint32_t post_ms, uint32_t threshold_mg, const char *metadata)
+{
+    if (!s_task || s_running || !lsm6dsv320x_present_mask() || threshold_mg > 320000 ||
+        (threshold_mg && threshold_mg < 20)) return false;
+    s_shot_error = shot_store_begin(pre_ms, post_ms, metadata);
+    if (s_shot_error != ESP_OK) return false;
+    s_pre_ms = pre_ms; s_post_ms = post_ms; s_threshold_mg = threshold_mg;
+    s_wifi_output = false; s_browser_output = false; s_shot_output = true;
+    s_trigger_us = 0; s_trigger_requested = false; s_saturation_mask = 0;
+    s_save_full_session = false;
+    s_duration_limit_us = 0;
+    s_overrun_mask = 0; s_stop_requested = false;
+    memset(s_counts, 0, sizeof(s_counts));
+    lsm6dsv320x_capture_start();
+    s_started_us = esp_timer_get_time(); s_running = true;
+    xTaskNotifyGive(s_task);
+    return true;
+}
+
+bool capture_trigger_shot(void)
+{
+    if (!capture_shot_ready()) return false;
+    s_trigger_requested = true;
+    return true;
+}
+bool capture_shot_active(void) { return s_running && s_shot_output; }
+bool capture_shot_ready(void)
+{
+    const int64_t elapsed = esp_timer_get_time() - s_started_us;
+    return capture_shot_active() && !s_trigger_us && !s_stop_requested &&
+        elapsed >= 0 && !shot_store_near_capacity();
+}
+uint32_t capture_shot_elapsed_ms(void)
+{
+    if (!capture_shot_active()) return 0;
+    const int64_t elapsed = esp_timer_get_time() - s_started_us;
+    return elapsed > 0 ? (uint32_t)(elapsed / 1000) : 0;
+}
+const char *capture_shot_state(void)
+{
+    if (capture_shot_active()) return s_trigger_us ? "post" : "armed";
+    if (shot_store_corrupt()) return "corrupt";
+    if (s_shot_error != ESP_OK) return "error";
+    return shot_store_saved() ? "saved" : "idle";
+}
+int capture_shot_error(void) { return (int)s_shot_error; }
+
 void capture_stop(void)
 {
-    if (s_running) s_stop_requested = true;
+    if (s_running) {
+        if (s_shot_output && s_trigger_us) s_overrun_mask |= 0x40U; /* Post-window cancelled. */
+        s_stop_requested = true;
+    }
 }
 
 bool capture_running(void)

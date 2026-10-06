@@ -6,12 +6,15 @@
 #include "usb.h"
 #include "wifi_stream.h"
 #include "web_capture.h"
+#include "shot_store.h"
 
 static const char *TAG = "bowvib";
 
 void app_main(void)
 {
-    esp_err_t err = led_status_init();
+    esp_err_t err = shot_store_init();
+    if (err != ESP_OK) ESP_LOGE(TAG, "Shot storage init failed: %s", esp_err_to_name(err));
+    err = led_status_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "LED status init failed: %s", esp_err_to_name(err));
     }

@@ -3,6 +3,8 @@ idf_component_register(
         "main.c"
         "lsm6dsv320x.c"
         "capture.c"
+        "shot_store.c"
+        "shot_usb.c"
         "led_status.c"
         "usb.c"
         "wifi_stream.c"
@@ -21,6 +23,9 @@ idf_component_register(
         freertos
         lwip
         nvs_flash
+        esp_partition
+        esp_rom
+        esp_hw_support
     EMBED_TXTFILES
         "web/index.html"
         "web/format.js"

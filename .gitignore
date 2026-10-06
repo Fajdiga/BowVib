@@ -19,5 +19,6 @@ __pycache__/
 test-artifacts/
 *.npy
 *.npz
+*.bvr
 *.csv
 !partitions.csv

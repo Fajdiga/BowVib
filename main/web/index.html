@@ -1,22 +1,80 @@
 <!doctype html>
 <html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BowVib capture</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0d1420">
+<title>BowVib · Pulse recorder</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#10151c;color:#e8edf3;font:16px system-ui,sans-serif}
-main{max-width:760px;margin:5vh auto;padding:20px}section{background:#171e28;border:1px solid #303b49;border-radius:14px;padding:24px}
-h1{font-size:1.6rem;margin:0 0 12px}p{color:#b6c5d6;line-height:1.5}#status{white-space:pre-wrap;line-height:1.6;min-height:100px;margin:20px 0}
-button{width:100%;background:#16834b;color:white;border:0;border-radius:8px;padding:16px;font-size:1rem;font-weight:700;cursor:pointer;margin:6px 0}
-button.secondary{background:#344354}button:disabled{opacity:.45;cursor:default}.hint{font-size:.9rem;color:#9baabc}
-canvas{display:block;width:100%;height:auto;margin-top:20px;border-radius:8px}canvas[hidden]{display:none}progress{width:100%;height:10px;accent-color:#22b86b}
-</style></head><body><main><section>
-<h1>BowVib capture</h1><p>Record all detected sensors directly over Wi-Fi.</p>
-<div id="status" role="status" aria-live="polite">Connecting to BowVib...</div>
-<progress id="progress" max="10" value="0" aria-label="Capture progress"></progress>
-<button id="record" disabled>Start 10-second capture</button>
-<button id="download" class="secondary" disabled>Save capture to this device</button>
-<button id="plot" class="secondary" disabled>Plot capture</button>
-<button id="savePlot" class="secondary" disabled>Save plot as PNG</button>
-<canvas id="chart" width="1200" height="1080" hidden></canvas>
-<p class="hint">Keep this page open and your screen awake during capture. The recording stays in this browser until you save it or record again. No PC or internet connection is needed.</p>
-</section></main><script src="/format.js"></script><script src="/capture.js"></script></body></html>
+:root{color-scheme:dark;--bg:#0d1420;--surface:#141e2c;--border:#2a3b50;--text:#edf3fa;--muted:#acbbcd;--accent:#6ce0b4}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1440px;margin:auto;padding:30px 32px 48px}button,input,select,textarea{font:inherit}button,input,select,textarea,summary{outline-offset:4px}:focus-visible{outline:2px solid var(--accent)}
+.app-head{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:26px}.brand{display:flex;align-items:center;gap:12px}.brand-mark{display:grid;place-items:center;width:42px;height:42px;color:var(--accent);background:#173d36;border:1px solid #2b6355;border-radius:12px}.brand-name{font-size:1.2rem;font-weight:750;letter-spacing:-.04em}.brand-subtitle{color:var(--muted);font-size:.78rem;letter-spacing:.035em}
+.badge{display:inline-flex;align-items:center;gap:8px;padding:7px 11px;border:1px solid var(--border);border-radius:999px;background:var(--surface);color:var(--muted);font-size:.8rem;font-weight:600}.badge::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}.badge[data-state="connected"]{color:var(--accent);border-color:#2b6355}.badge[data-state="recording"]{color:#fbc875}.badge[data-state="offline"]{color:#ff9ba1}
+section{background:var(--surface);border:1px solid var(--border);border-radius:18px;margin-bottom:22px;overflow:hidden}.section-heading{display:flex;align-items:flex-start;gap:14px;margin-bottom:24px}.step{flex:none;display:grid;place-items:center;width:30px;height:30px;background:#243548;border:1px solid #344a63;border-radius:9px;color:#c6d9ed;font-size:.76rem;font-weight:700}h1,h2{margin:0;letter-spacing:-.035em;line-height:1.25}h1{font-size:1.65rem}h2{font-size:1.35rem}p{margin:8px 0 0;color:var(--muted)}.eyebrow{color:var(--accent);font-size:.72rem;font-weight:700;letter-spacing:.11em;text-transform:uppercase;margin-bottom:7px}
+.capture-layout{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(320px,.85fr)}.capture-settings{padding:28px 30px}.capture-panel{padding:28px 30px;background:#111b28;border-left:1px solid var(--border);display:flex;flex-direction:column;justify-content:center}#captureHint{max-width:650px;font-size:.92rem;line-height:1.65}.settings{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}label{color:#c9d6e5;font-size:.85rem;font-weight:600}input[type="number"],textarea,select{display:block;width:100%;background:var(--bg);border:1px solid #3b4e65;border-radius:9px;color:var(--text);padding:11px 12px;margin-top:8px}input[type="number"]{font-size:1.1rem;font-weight:600;font-variant-numeric:tabular-nums}input:disabled,select:disabled,textarea:disabled{opacity:.5}.field-note{display:block;margin-top:6px;font-size:.74rem;font-weight:400;color:var(--muted)}.unit{color:var(--muted);font-weight:400}.hint{color:var(--muted);font-size:.8rem;line-height:1.65}.trigger-note{margin-top:18px}.trigger-note strong{color:#d6e4f2;font-weight:500}
+details{margin-top:22px;border-top:1px solid var(--border);padding-top:16px}summary{width:fit-content;color:var(--muted);cursor:pointer;font-size:.83rem}details[open] summary{margin-bottom:12px}textarea{min-height:86px;resize:vertical;font:.82rem/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}.panel-label{font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:600}#status{white-space:pre-wrap;line-height:1.65;min-height:68px;margin:10px 0 16px;font-size:.95rem;color:#dce9f7}
+progress{display:block;appearance:none;width:100%;height:6px;border:0;border-radius:99px;overflow:hidden;background:#28364a;accent-color:var(--accent)}progress::-webkit-progress-bar{background:#28364a}progress::-webkit-progress-value{background:var(--accent);border-radius:99px}progress::-moz-progress-bar{background:var(--accent)}
+button{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:42px;border:1px solid transparent;border-radius:9px;background:var(--accent);color:#0b2e25;padding:10px 16px;font-weight:650;font-size:.86rem;cursor:pointer;transition:background .15s,border-color .15s,opacity .15s}button:hover:not(:disabled){background:#9bedd0}button:active:not(:disabled){transform:translateY(1px)}button.secondary{background:#223247;border-color:#35485f;color:#dbe8f7}button.secondary:hover:not(:disabled){background:#30445e;border-color:#516d8e}button.quiet{background:transparent;border-color:var(--border);color:var(--muted)}button.quiet:hover:not(:disabled){background:#223247;color:var(--text)}button.danger{color:#ffb2b6}button.danger:hover:not(:disabled){background:#422630;border-color:#774553}button:disabled{opacity:.38;cursor:default}#record{width:100%;min-height:48px;font-size:1rem;margin-top:20px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}.capture-panel .actions button{flex:1}.storage-note{margin-top:16px;font-size:.75rem;line-height:1.6;color:#9aaec4}
+.recording-files{padding:18px 30px;border-top:1px solid var(--border);display:flex;align-items:center;gap:18px;flex-wrap:wrap}.recording-files .actions{margin:0;gap:8px;flex:1}.recording-files .actions button{padding:9px 13px;min-height:40px}.recording-files #delete{margin-left:auto}#result{color:var(--muted);white-space:pre-wrap;line-height:1.65;font-size:.8rem;font-variant-numeric:tabular-nums;padding:0 30px 20px}#result:empty{display:none}
+#plotArea{padding:26px 30px 22px}.plot-head{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;flex-wrap:wrap}.plot-head .section-heading{margin:0}.plot-title p{font-size:.85rem}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.toolbar button{padding:9px 12px;min-height:40px}#focusEvent{color:var(--accent);border-color:#346755;background:#19372f}#focusEvent:hover:not(:disabled){background:#244d40}
+.plot-controls{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px;margin-top:23px;padding:15px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border)}.plot-options{display:flex;align-items:center;gap:18px;flex-wrap:wrap}.mode-control{display:flex;align-items:center;gap:9px;white-space:nowrap}.mode-control select{margin:0;width:auto;min-height:38px;font-size:.82rem;padding:7px 30px 7px 10px}.check-label{display:inline-flex;align-items:center;gap:8px;cursor:pointer;font-size:.8rem;font-weight:500;color:var(--muted)}input[type="checkbox"]{width:16px;height:16px;margin:0;accent-color:var(--accent);cursor:pointer}
+#sensorControls{display:flex;gap:7px;flex-wrap:wrap}.sensor{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;min-height:38px;border:1px solid var(--border);border-radius:8px;background:#101a27;font-size:.78rem;cursor:pointer;font-weight:600;color:var(--sensor)}.sensor input{accent-color:var(--sensor)}.sensor:has(input:not(:checked)){opacity:.5}.sensor:has(input:disabled){cursor:default}.plot-meta{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin:16px 0 0;font-size:.77rem;color:var(--muted)}#viewLabel{font-variant-numeric:tabular-nums;color:#d5e3f3}#plotSummary{margin:0;flex:1}
+canvas{display:block;width:100%;min-width:0;touch-action:none;cursor:grab;margin:12px 0;border-radius:10px}canvas:active{cursor:grabbing}.pan-control{display:flex;align-items:center;gap:16px;font-size:.77rem;font-weight:500;color:var(--muted)}#pan{flex:1;min-width:0;width:100%;padding:0;margin:0;accent-color:var(--accent);min-height:28px;cursor:pointer}.plot-help{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;border-top:1px solid var(--border);padding-top:13px;margin-top:12px;font-size:.75rem}kbd{font:inherit;color:#d1deed;background:#233247;border:1px solid #3a4e66;border-radius:4px;padding:1px 4px}footer{color:#7489a3;font-size:.75rem;text-align:center;margin-top:25px}[hidden]{display:none!important}
+@media(min-width:1440px){main{padding-top:38px}}@media(max-width:1000px){main{padding:24px}.capture-layout{grid-template-columns:1fr 1fr}.capture-settings,.capture-panel{padding:24px}.settings{gap:10px}.recording-files{padding:18px 24px}#plotArea{padding:24px}.plot-head{gap:18px}.toolbar{width:100%}.plot-controls{align-items:flex-start}.plot-options{gap:12px}}
+@media(max-width:760px){main{padding:18px 14px 30px}.app-head{margin-bottom:20px}.brand-subtitle{font-size:.7rem}.badge{font-size:.72rem}.capture-layout{grid-template-columns:1fr}.capture-settings,.capture-panel{padding:22px}.capture-panel{border-left:0;border-top:1px solid var(--border)}.section-heading{margin-bottom:20px}.recording-files{padding:18px 22px;gap:12px}.recording-files .panel-label{width:100%}.recording-files .actions{width:100%}.recording-files #delete{margin-left:0}.recording-files .actions button{flex:1 1 calc(50% - 8px)}#result{padding:0 22px 20px}#plotArea{padding:22px 16px 18px}.plot-controls{gap:13px}.plot-options{justify-content:space-between;width:100%}.plot-meta{gap:8px}.plot-meta #plotSummary{flex-basis:100%}h1{font-size:1.45rem}h2{font-size:1.2rem}.plot-help{gap:6px}.toolbar{gap:6px}.toolbar button{flex:1;white-space:nowrap;padding:9px 10px;font-size:.8rem}}
+@media(max-width:420px){.capture-settings,.capture-panel{padding:20px 16px}.settings{gap:8px}.settings label{font-size:.77rem}.field-note{font-size:.69rem}input[type="number"]{padding:10px 8px}.app-head{gap:10px}.brand{gap:8px}.brand-mark{width:36px;height:36px}.brand-name{font-size:1.1rem}.badge{padding:6px 8px}.plot-options{align-items:flex-start}.check-label{min-height:38px}.sensor{padding:7px 8px}.recording-files{padding:16px}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important}}
+</style></head>
+<body><main>
+<header class="app-head"><div class="brand"><div class="brand-mark" aria-hidden="true"><svg width="27" height="27" viewBox="0 0 28 28" fill="none"><path d="M2 15h6l3-9 5 17 3-11 2 3h5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div><div class="brand-name">BowVib</div><div class="brand-subtitle">PULSE CAPTURE &amp; ANALYSIS</div></div></div><div id="connectionBadge" class="badge" role="status">Connecting</div></header>
+<section aria-labelledby="captureTitle"><div class="capture-layout"><div class="capture-settings">
+<div class="section-heading"><span class="step" aria-hidden="true">01</span><div><div class="eyebrow">Capture setup</div><h1 id="captureTitle">Record a pulse</h1><p id="captureHint">A pulse at the threshold keeps the previous 10 seconds and the next 3 seconds. With no pulse, recording continues until storage is full. A pulse near capacity may have an incomplete tail.</p></div></div>
+<div class="settings">
+<label for="thresholdG">Trigger <span class="unit">/ g</span><input id="thresholdG" type="number" min="0" max="320" step="0.1" value="50" inputmode="decimal"><span class="field-note">0 = manual trigger</span></label>
+<label for="preSeconds">Before pulse <span class="unit">/ s</span><input id="preSeconds" type="number" min="0" max="10" step="0.1" value="10" inputmode="decimal"><span class="field-note">Up to 10 seconds</span></label>
+<label for="postSeconds">After pulse <span class="unit">/ s</span><input id="postSeconds" type="number" min="0" max="3" step="0.1" value="3" inputmode="decimal"><span class="field-note">Up to 3 seconds</span></label>
+</div><p class="hint trigger-note">Triggered by <strong>XYZ magnitude</strong> on any sensor. An early pulse keeps the available history.</p>
+<details><summary>Test notes &amp; metadata</summary><label for="shotMetadata">Metadata (JSON)<textarea id="shotMetadata" spellcheck="false">{}</textarea></label></details>
+</div><div class="capture-panel"><div class="panel-label">Recorder status</div><div id="status" role="status" aria-live="polite">Connecting to BowVib...</div><progress id="progress" max="20" value="0" aria-label="Recording progress"></progress>
+<button id="record" disabled>Start recording</button><div class="actions"><button id="retryConnection" class="secondary" type="button" onclick="location.reload()">Retry connection</button><button id="reloadPage" class="quiet" type="button" onclick="location.reload()" hidden>Reload page</button></div><div class="actions"><button id="trigger" class="secondary" disabled>Trigger now</button><button id="cancel" class="quiet" disabled>Cancel</button></div><p class="storage-note">Recordings stay on the board after power-off. Save your recording, then delete it from the board to begin a new capture.</p></div></div>
+<div class="recording-files"><div class="panel-label">Your recording</div><div class="actions"><button id="plot" class="secondary" disabled>View plot</button><button id="download" class="secondary" disabled>Save raw recording</button><button id="downloadNpz" class="secondary" disabled>Save NPZ</button><button id="delete" class="quiet danger" disabled>Delete from board</button></div></div><div id="result"></div>
+</section>
+<section id="plotArea" aria-labelledby="plotTitle" hidden>
+<div class="plot-head"><div class="section-heading"><span class="step" aria-hidden="true">02</span><div class="plot-title"><div class="eyebrow">Signal explorer</div><h2 id="plotTitle">Acceleration over time</h2><p>Inspect the pulse, compare sensors, and explore the detail.</p></div></div><div class="toolbar" role="group" aria-label="Plot navigation">
+<button id="focusEvent" class="secondary" title="Center the view on the trigger at zero seconds">Center event</button><button id="zoomIn" class="secondary" aria-label="Zoom in" title="Zoom in">Zoom +</button><button id="zoomOut" class="secondary" aria-label="Zoom out" title="Zoom out">Zoom −</button><button id="resetZoom" class="secondary" title="Show the entire recording">Full view</button><button id="savePlot" class="quiet" disabled>Save PNG</button>
+</div></div>
+<div class="plot-controls"><div id="sensorControls" role="group" aria-label="Visible sensors">
+<label class="sensor" style="--sensor:#60a5fa"><input id="sensor0" type="checkbox" checked>Sensor A</label><label class="sensor" style="--sensor:#fb923c"><input id="sensor1" type="checkbox" checked>Sensor B</label><label class="sensor" style="--sensor:#4ade80"><input id="sensor2" type="checkbox" checked>Sensor C</label><label class="sensor" style="--sensor:#f472b6"><input id="sensor3" type="checkbox" checked>Sensor D</label>
+</div><div class="plot-options"><label class="mode-control" for="plotMode">Show<select id="plotMode"><option value="xyz">X / Y / Z axes</option><option value="magnitude">XYZ magnitude</option></select></label><label class="check-label"><input id="autoFocus" type="checkbox" checked>Focus event on load</label></div></div>
+<div class="plot-meta"><p id="plotSummary">Time is relative to the trigger, or recording start when there is no trigger.</p><output id="viewLabel" aria-label="Visible time range"></output></div>
+<canvas id="chart" width="1200" height="760" tabindex="0" aria-label="Acceleration in g over time for each selected sensor"></canvas>
+<label class="pan-control" for="pan">Pan recording<input id="pan" type="range" min="0" max="1000" value="0" disabled aria-label="Pan through recording"></label>
+<div class="hint plot-help"><span>Pinch or scroll to zoom · Drag to pan · <kbd>Shift</kbd> + drag to select a range</span><span><strong>Center event</strong> returns to the trigger at zero.</span></div>
+</section><footer>BowVib · Four sensors. One moment, in detail.</footer>
+</main>
+<noscript><p>JavaScript is required to control BowVib. Open this address in Safari, Chrome, Firefox or Edge with JavaScript enabled.</p></noscript>
+<script>
+(function () {
+  var startupTimer;
+  function fail(message) {
+    clearTimeout(startupTimer);
+    document.getElementById("status").textContent = message;
+    var badge = document.getElementById("connectionBadge");
+    badge.textContent = "Page needs attention"; badge.dataset.state = "offline";
+    document.getElementById("reloadPage").hidden = false;
+  }
+  window.BowVibBoot = {
+    fail: fail,
+    started: function () { clearTimeout(startupTimer); },
+    connected: function () { document.getElementById("reloadPage").hidden = true; }
+  };
+  window.addEventListener("error", function (event) {
+    if (event.target && event.target.tagName === "SCRIPT") {
+      fail("A page file could not load from BowVib. Stay connected to BowVib-IMU Wi-Fi and tap Reload page.");
+    } else if (event.message) {
+      fail("Page error: " + event.message + ". Tap Reload page; if it repeats, report this message.");
+    }
+  }, true);
+  startupTimer = setTimeout(function () {
+    fail("The recording controls did not start. Stay connected to BowVib-IMU Wi-Fi and tap Reload page. Open http://192.168.4.1/ in your normal browser.");
+  }, 10000);
+}());
+</script>
+<script src="/format.js?v=20261006-1"></script><script src="/capture.js?v=20261006-1"></script></body></html>

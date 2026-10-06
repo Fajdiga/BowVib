@@ -252,6 +252,7 @@ uint16_t lsm6dsv320x_fifo_level(unsigned imu)
     uint8_t status[2] = {0};
     if (imu >= LSM6DSV320X_COUNT || read_burst(imu, REG_FIFO_STATUS1,
                                                status, sizeof(status)) != ESP_OK) {
+        if (imu < LSM6DSV320X_COUNT) s_overrun_mask |= (uint8_t)(1U << imu);
         return 0;
     }
     if (status[1] & (FIFO_OVR_IA | FIFO_OVR_LATCHED)) {
@@ -264,7 +265,7 @@ bool lsm6dsv320x_fifo_overrun(unsigned imu)
 {
     if (imu < LSM6DSV320X_COUNT) {
         uint8_t status = 0;
-        if (read_reg(imu, REG_FIFO_STATUS2, &status) == ESP_OK &&
+        if (read_reg(imu, REG_FIFO_STATUS2, &status) != ESP_OK ||
             (status & (FIFO_OVR_IA | FIFO_OVR_LATCHED))) {
             s_overrun_mask |= (uint8_t)(1U << imu);
         }

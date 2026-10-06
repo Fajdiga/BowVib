@@ -3,6 +3,7 @@
 #include "led_status.h"
 #include "lsm6dsv320x.h"
 #include "wifi_stream.h"
+#include "shot_usb.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -84,6 +85,7 @@ static void status(void)
 
 static void handle_line_unlocked(char *line)
 {
+    if ((!capture_running() || capture_shot_active()) && shot_usb_command(line)) return;
     char *cmd = strtok(line, " \t");
     if (!cmd) return;
     if (capture_running()) {
@@ -143,6 +145,7 @@ static void handle_line_unlocked(char *line)
         else usb_printf("ERR not_running\n");
     } else if (!strcmp(cmd, "HELP") || !strcmp(cmd, "?")) {
         usb_printf("BowVib commands: START STOP STATUS SCAN LEDTEST CSATEST HELP\n");
+        usb_printf("Shot USB: SHOTARM pre_ms post_ms threshold_mg, SHOTTRIGGER SHOTSTATUS SHOTGET SHOTCANCEL SHOTDELETE\n");
         usb_printf("START streams detected HG FIFO channels A-D, 7680 Hz, +/-320 g.\n");
         usb_printf("SCAN retries all four chip selects; LEDTEST flashes GPIO3,4,5.\n");
         usb_printf("CSATEST toggles CS_A/GPIO16 every second for 10 transitions.\n");
@@ -174,7 +177,7 @@ static void usb_task(void *arg)
     }
     status();
 
-    char line[64];
+    char line[640];
     size_t pos = 0;
     for (;;) {
         uint8_t byte;

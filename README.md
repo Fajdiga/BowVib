@@ -1,5 +1,22 @@
 # BowVib: four LSM6DSV320X vibration channels
 
+## On-board shot recording
+
+The firmware now also stores triggered shots in the ESP32-C6's internal flash. The unified phone page defaults to a **50 g** pulse trigger with **10 s before + 3 s after**. An early pulse keeps the available history; with no pulse, acquisition continues until flash capacity and the full session is saved. The 8 MiB flash holds a 1 MiB firmware partition and a **6.9375 MiB recording partition**; a small reserve accommodates FIFO draining. Duration depends on sensor count, actual rates and frame overhead. A pulse near capacity can have an incomplete post-window, flagged for review. Pre/post settings and threshold can be changed in the page or `shot_tool.py`. Flash is erased before acquisition. A completed shot survives reset and must be explicitly deleted before the next shot. Existing live capture modes remain available.
+
+The expanded layout moves recording storage from `0x210000` to `0x110000`. Download any saved BVR before installing this partition table: existing recordings require migration and are not preserved by simply flashing the new layout. The current firmware fits in 1 MiB; future builds must also pass the partition size check.
+
+```powershell
+python shot_tool.py --port COM92 arm --pre 10 --post 3
+# Automatic 50 g trigger is enabled by default; optionally trigger manually.
+python shot_tool.py --port COM92 trigger
+python shot_tool.py --port COM92 download shot.bvr
+python shot_tool.py export shot.bvr exports
+python shot_tool.py analyze shot.bvr shot.png
+```
+
+See [recording instructions and format](docs/recording.md), [customer requirement coverage](docs/customer-requirements.md), and [calibration procedure](docs/calibration.md). The partition table changed: rebuild and flash the table/application together for the first upgrade. Four channels at 7,680 Hz are retained; six channels, 10 kHz and verified hardware sync require additional hardware work.
+
 ESP-IDF firmware for an ESP32-C6-MINI-1-H8 and four LSM6DSV320X IMUs. The firmware enables each IMU's high-g accelerometer at its maximum 7,680 samples/s and +/-320 g range. Each IMU writes to its own FIFO; the C6 polls and drains those FIFOs in order 1, 2, 3, 4 over one shared SPI bus. Samples stream live over USB Serial/JTAG, raw TCP, or directly to a phone browser over Wi-Fi.
 
 The H8 module provides 8 MB flash and no PSRAM. Wi-Fi capture uses a 32 KiB FreeRTOS stream buffer and a separate transmit task so brief network stalls do not block FIFO draining. This is a short-term queue, not an on-board recording buffer; sustained Wi-Fi throughput still needs to keep up with the four live channels. Four channels produce 30,720 XYZ samples/s total, or 184,320 payload bytes/s before frame headers. The host utilities decode signed 16-bit counts into `int32` arrays and store them in compressed `.npz` archives for offline analysis.
@@ -56,12 +73,14 @@ The ESP32-C6 starts a local WPA2 access point, a browser page, and a TCP capture
 1. Power the board. USB can provide power; no USB data connection is needed.
 2. Connect the phone to `BowVib-IMU` with password `BowVib320x`. Stay connected if the phone warns that this network has no internet.
 3. Open **http://192.168.4.1/** in the phone browser. Use `http`, not `https`, and omit `:3333`.
-4. Press **Start 10-second capture**. Keep the page visible and the screen awake until it finishes.
-5. Press **Save capture to this device** to download the `.npz` file. **Plot capture** shows XYZ; **Save plot as PNG** saves the image.
+4. Press **Start recording**. The default 50 g pulse selects up to 10 s before and 3 s after; no pulse records until storage is full and saves the full session.
+5. The plot opens around the trigger. Pinch with two fingers or scroll to zoom; drag to pan. **Center event** returns to the pulse, **Full view** shows the recording, and Shift+drag selects a time range. Toggle sensors or choose **XYZ magnitude** to see the saved threshold. Save the raw `.bvr`, `.npz`, or plot PNG. Save and delete the stored recording before recording again.
 
-The ESP32 serves the complete page and streams binary samples over a WebSocket. It stops acquisition automatically after ten seconds, even if the browser timer is delayed. The phone holds the recording in memory and creates the archive locally. Save it before refreshing the page, closing the tab, or starting another capture. Only one browser can hold the capture connection at a time; close other capture tabs if the page keeps reconnecting. A disconnected capture is stopped and discarded.
+The ESP32 serves the complete page and records into internal flash. Recording continues if the browser disconnects, and the saved recording survives power-off. The browser validates the downloaded recording and creates its NPZ and zoomable XYZ plot locally. One recording fits on the board at a time; it is never automatically overwritten.
 
-The phone page validates frame/footer counts and refuses to save captures with an overrun/transport error. Phone archives retain little-endian signed `int16` channels in an uncompressed NPZ ZIP; Python archives use `int32` channels and compression. Both open in `inspect_raw.py` and preserve full channel counts. The phone archive omits the redundant common-length `samples_lsb` array; the inspector constructs it on load.
+New automatic recordings retain the triggering sensor and sample index. The first observed sample at or above the threshold becomes time zero in plots and exports, removing the late marker caused by FIFO/task processing delay. Timing between independent sensors remains estimated. The updated browser and `shot_tool.py` read both legacy BVR v1 and new v2 recordings; older recordings retain their original software trigger time. Flash the updated application to enable the new recorder and interface.
+
+The phone page checks manifest/page CRCs, page order, timestamps and per-sensor sample continuity. Quality and saturation warnings are shown beside the plot; flagged raw data remains downloadable for diagnosis. Phone archives retain little-endian signed `int16` channels in an uncompressed NPZ ZIP; Python archives use `int32` channels and compression. Both open in `inspect_raw.py` and preserve full channel counts. The phone archive includes per-sensor estimated time arrays and recording metadata. It omits the redundant common-length `samples_lsb` array; the inspector constructs it on load.
 
 Port 3333 carries the raw command/binary protocol and cannot display an HTTP webpage.
 
