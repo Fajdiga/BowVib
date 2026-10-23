@@ -117,7 +117,18 @@ For older browser archives that contain only individual IMU arrays, the inspecto
 
 The PC hosts a control page at `http://127.0.0.1:8765/`; the board performs acquisition and transfers the recording after it finishes. Use the direct data-ready firmware from this branch (recording format v5) with its recording partition table. This script does not flash or update the board.
 
-From a terminal in the repository folder, install the Python dependencies once:
+Customer quick start on Windows (Python 3.10 or newer and Git installed):
+
+```powershell
+git clone --branch experiment/esp32c6-h8-lsm6dsv320x --single-branch https://github.com/Fajdiga/BowVib.git
+cd BowVib
+python -m pip install -r requirements.txt
+python capture_button.py --wifi
+```
+
+Connect the PC to the `BowVib-IMU` Wi-Fi network before running the last command, then open `http://127.0.0.1:8765/`. Repository access is required to clone. These examples control a real board; `capture_button.py` has no simulated-data mode.
+
+If the repository is already downloaded, run commands from its folder. Install the Python dependencies once:
 
 ```powershell
 python -m pip install -r requirements.txt
