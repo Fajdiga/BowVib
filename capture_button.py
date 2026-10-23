@@ -15,6 +15,7 @@ import io
 import json
 import math
 import os
+import re
 from pathlib import Path
 import signal
 import threading
@@ -273,8 +274,17 @@ class Recorder:
             return {'timestamp': self.saved_id, 'duration': max(t[-1] for t in self.shot.times if len(t)) - min(t[0] for t in self.shot.times if len(t)), 'series': series}
 
 
-def show_capture(source, web_port, output_dir):
+def render_page(settings):
+    page = PAGE
+    for name in ('seconds', 'threshold_g', 'pre_seconds', 'post_seconds'):
+        page = re.sub(r'(<input id="' + name + r'"[^>]*\bvalue=")[^"]*',
+                      lambda match: match[1] + format(getattr(settings, name), 'g'), page)
+    return page
+
+
+def show_capture(source, web_port, output_dir, defaults=None):
     recorder = Recorder(source, output_dir)
+    page = render_page(defaults or CaptureSettings())
     worker = threading.Thread(target=recorder.run, daemon=True)
 
     class Handler(BaseHTTPRequestHandler):
@@ -294,7 +304,7 @@ def show_capture(source, web_port, output_dir):
         def do_GET(self):
             try:
                 if self.path == '/':
-                    self.respond(200, PAGE.encode(), 'text/html; charset=utf-8')
+                    self.respond(200, page.encode(), 'text/html; charset=utf-8')
                 elif self.path == '/data':
                     self.respond(200, json.dumps(recorder.view).encode())
                 elif self.path == '/plot-data':
@@ -349,12 +359,26 @@ def build_parser():
     group.add_argument('--port', help='USB serial port, e.g. COM92')
     parser.add_argument('--web-port', type=int, default=8765)
     parser.add_argument('--output-dir', type=Path, default=Path('captures'))
+    parser.add_argument('--pre', type=float, default=10,
+                        help='Initial pre-trigger history in seconds, 0-10 (default: 10)')
+    parser.add_argument('--threshold', '--threshold-g', dest='threshold', type=float, default=50,
+                        help='Initial trigger level in g, 0.02-320; 0 for manual (default: 50)')
+    parser.add_argument('--post', type=float, default=3,
+                        help='Initial post-trigger duration in seconds, 0-3 (default: 3)')
+    parser.add_argument('--seconds', type=float, default=10,
+                        help='Initial timed-capture interval in seconds, 0.01-10 (default: 10)')
     return parser
 
 
 def main():
-    args = build_parser().parse_args()
-    show_capture(Source(args.wifi, args.port), args.web_port, args.output_dir)
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        defaults = CaptureSettings.parse(dict(mode='trigger', seconds=args.seconds,
+            pre_seconds=args.pre, threshold_g=args.threshold, post_seconds=args.post))
+    except ValueError as exc:
+        parser.error(str(exc))
+    show_capture(Source(args.wifi, args.port), args.web_port, args.output_dir, defaults)
     return 0
 
 

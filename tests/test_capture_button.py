@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import numpy as np
-from capture_button import CaptureSettings, Recorder, Source, PAGE
+from capture_button import CaptureSettings, Recorder, Source, PAGE, build_parser, render_page
 from test_hardware_timing import hardware_fixture
 from shot_tool import read_shot
 
@@ -136,6 +136,17 @@ class CaptureButtonTests(unittest.TestCase):
                        {'mode': 'trigger', 'threshold_g': .01}):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 CaptureSettings.parse(values)
+
+    def test_launch_parameters_prefill_browser_fields(self):
+        args = build_parser().parse_args(['--wifi', '--pre', '5', '--threshold', '25',
+                                         '--post', '2', '--seconds', '4'])
+        settings = CaptureSettings.parse(dict(mode='trigger', pre_seconds=args.pre,
+            threshold_g=args.threshold, post_seconds=args.post, seconds=args.seconds))
+        page = render_page(settings)
+        for name, value in [('pre_seconds', '5'), ('threshold_g', '25'),
+                            ('post_seconds', '2'), ('seconds', '4')]:
+            self.assertRegex(page, '<input id="' + name + '"[^>]*value="' + value + '"')
+        self.assertEqual(build_parser().parse_args(['--port', 'COM92', '--threshold-g', '0']).threshold, 0)
 
     def test_usb_uses_shot_protocol(self):
         source = Source(port='COM92')

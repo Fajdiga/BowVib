@@ -146,6 +146,21 @@ Or connect the PC to the `BowVib-IMU` access point and run:
 python capture_button.py --wifi
 ```
 
+Set pre-trigger time, trigger level, and post-trigger time directly in the launch command:
+
+```powershell
+# 10 seconds before the pulse, 50 g trigger, 3 seconds after the pulse:
+python capture_button.py --wifi --pre 10 --threshold 50 --post 3
+
+# Same settings over USB:
+python capture_button.py --port COM92 --pre 10 --threshold 50 --post 3
+
+# Manual trigger only, keeping 5 seconds before and 2 seconds after:
+python capture_button.py --wifi --pre 5 --threshold 0 --post 2
+```
+
+`--pre` and `--post` are in **seconds**; `--threshold` is in **g** (`--threshold-g` is an alias). These options prefill the browser fields; they do not start acquisition automatically. Open the page and press **Start trigger capture** to arm the board. For manual-only mode, then press **Trigger now** when the event occurs. You can still edit the fields on the page. Use `--seconds 5` to prefill a five-second interval for the separate **Start capture** button.
+
 Keep that terminal open and visit `http://127.0.0.1:8765/` in a browser. Wait for **Board ready**. If the board already holds a recording, the script first downloads and verifies it. To change the local page port or recording folder:
 
 ```powershell
