@@ -340,11 +340,8 @@ def check_outputs(paths: list[Path], overwrite: bool) -> None:
         raise FileExistsError("Already exists: " + ", ".join(existing))
 
 
-def export_shot(shot: Shot, directory: Path, calibration: dict, overwrite: bool = False) -> None:
-    stem = "shot_" + shot.metadata["id"]
-    npz, csv_path, json_path = [directory / (stem + suffix) for suffix in (".npz", ".csv", ".json")]
-    check_outputs([npz, csv_path, json_path], overwrite)
-    directory.mkdir(parents=True, exist_ok=True)
+def archive_payload(shot: Shot, calibration: dict) -> dict:
+    """Build the common NPZ payload without changing original sample timing."""
     ids = [i + 1 for i in range(4) if shot.metadata["present_mask"] & (1 << i)]
     meta = {**shot.metadata, "calibration": calibration}
     g_arrays = processed(shot, calibration)
@@ -368,6 +365,17 @@ def export_shot(shot: Shot, directory: Path, calibration: dict, overwrite: bool 
                    configured_sample_rate_hz=7680, full_scale_g=320, output_bits=16,
                    capture_duration_s=duration, overrun_mask=shot.metadata["quality_mask"],
                    overrun_mask_valid=1, shot_metadata_json=json.dumps(meta, ensure_ascii=False))
+    return payload
+
+
+def export_shot(shot: Shot, directory: Path, calibration: dict, overwrite: bool = False) -> None:
+    stem = "shot_" + shot.metadata["id"]
+    npz, csv_path, json_path = [directory / (stem + suffix) for suffix in (".npz", ".csv", ".json")]
+    check_outputs([npz, csv_path, json_path], overwrite)
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = archive_payload(shot, calibration)
+    g_arrays = processed(shot, calibration)
+    meta = {**shot.metadata, "calibration": calibration}
     np.savez_compressed(npz, **payload)
     with csv_path.open("w", newline="", encoding="utf-8") as output:
         writer = csv.writer(output)
@@ -468,7 +476,7 @@ def api(host: str, path: str, data: bytes | None = None) -> bytes:
         return response.read()
 
 
-def usb_api(port: str, command: str) -> bytes:
+def usb_api(port: str, command: str, timeout: float = 120) -> bytes:
     import serial
     connection = serial.Serial(port=None, baudrate=115200, timeout=.2, write_timeout=3)
     connection.dtr = False; connection.rts = False; connection.port = port
@@ -476,7 +484,7 @@ def usb_api(port: str, command: str) -> bytes:
     with connection:
         connection.reset_input_buffer()
         connection.write((command + "\n").encode("utf-8"))
-        deadline, line = time.monotonic() + 120, bytearray()
+        deadline, line = time.monotonic() + timeout, bytearray()
         while time.monotonic() < deadline:
             byte = connection.read(1)
             if byte in (b"\r", b"\n"):

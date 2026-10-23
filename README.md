@@ -115,7 +115,15 @@ For older browser archives that contain only individual IMU arrays, the inspecto
 
 ## PC-hosted capture page (optional)
 
-Run the capture page over USB:
+The PC hosts a control page at `http://127.0.0.1:8765/`; the board performs acquisition and transfers the recording after it finishes. Use the direct data-ready firmware from this branch (recording format v5) with its recording partition table. This script does not flash or update the board.
+
+From a terminal in the repository folder, install the Python dependencies once:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+Run the capture page over USB (replace `COM92` with the board's port from Windows Device Manager, and close any serial monitor using it):
 
 ```powershell
 python capture_button.py --port COM92
@@ -127,13 +135,37 @@ Or connect the PC to the `BowVib-IMU` access point and run:
 python capture_button.py --wifi
 ```
 
-Open the printed page address. The board remains idle until **Start 10-second capture** is pressed. It then samples the detected IMUs, drains their FIFOs in order 1-2-3-4, stops after ten seconds, and reports per-sensor sample counts and rates. The page supports repeated captures. **Save capture to this device** downloads independent raw XYZ arrays with a unique timestamped `.npz` filename. **Plot capture** displays the three axes for each IMU in the browser; **Save plot as PNG** downloads that plot.
+Keep that terminal open and visit `http://127.0.0.1:8765/` in a browser. Wait for **Board ready**. If the board already holds a recording, the script first downloads and verifies it. To change the local page port or recording folder:
 
-Each device can run at a slightly different actual ODR. The page and NPZ therefore show both the measured rate (samples divided by capture duration) and the trim-predicted rate from each IMU's `INTERNAL_FREQ_FINE` value. Unequal counts alone do not prove loss. A clear FIFO/stream-overrun flag reports detected overflow, but a clear flag cannot detect every possible missing or malformed sample; compare measured and trim-predicted rates and verify frame/footer counts when validating a capture.
+```powershell
+python capture_button.py --wifi --web-port 8766 --output-dir "C:\BowVibCaptures"
+```
 
-Malformed frames, absent-sensor data, and frame/footer count mismatches are rejected. Invalid browser captures cannot be downloaded as successful recordings. If a USB stream fails, restart the capture page to reconnect; Wi-Fi reconnects on the next capture attempt. Use one host receiver per board. USB and TCP commands share a firmware lock, and commands other than `STOP` are ignored on the active binary stream to keep text replies out of sample data. A client on the other transport can request `STATUS`; its capture/diagnostic commands return `ERR busy`.
+With this example, open `http://127.0.0.1:8766/`. Relative output paths are resolved from the terminal's current folder.
 
-For phone control/storage, keep the PC and capture page running and open the printed PC address in the phone browser while both are on the same local network. Or connect both the PC and phone to `BowVib-IMU` when using Wi-Fi capture; the ESP32 access point accepts two stations. The phone saves the downloaded NPZ file to Downloads. If Windows Firewall prompts, allow Python on the private network. This button-triggered clip is ten seconds after the button press; the final pre-event/post-event trigger window can be added after capture quality is established.
+For a typical pulse recording:
+
+1. Set **Trigger** to `50` g, **Pre-buffer** to `10` s, and **Post-buffer** to `3` s.
+2. Press **Start trigger capture**. Wait at least ten seconds before the event if you need a full ten-second history.
+3. Apply the pulse, or press **Trigger now** to trigger manually. Use `0` g to disable automatic triggering.
+4. Wait for capture, download, and validation to finish. The page shows the PC save location and any quality warnings.
+5. Use **Plot capture**, **Save plot as PNG**, or **Save capture to this device**. Start another capture when ready; the previous PC files are retained.
+
+Open the printed page address. This script uses the same on-board direct data-ready recorder as the built-in webpage: HTTP `/shot/*` commands over Wi-Fi or `SHOT*` commands over USB. It does not stream sensor FIFO data to the PC. Use firmware supporting direct recording format v5; older FIFO recordings are rejected rather than silently substituted.
+
+**Start trigger capture** sends the threshold and pre/post windows to the board. Automatic pulse detection and capture timing run on the board. Set the threshold to zero for manual triggering, then press **Trigger now**. Limits match the board: up to 10 seconds before the trigger, 3 seconds after, and 0.02 to 320 g for an automatic threshold. An early pulse retains only history available since arming. Without a trigger, the board records until storage fills and saves the full session.
+
+**Start capture** keeps the selected interval (up to 10 seconds) before a manual trigger issued by the PC after that interval, with a zero post-buffer. Keep the PC connected in this mode. Command/polling latency shifts the window's position; it is not an exact acquisition deadline enforced by firmware.
+
+After capture ends, the PC downloads and validates the original recording, then saves timestamped `.bvr` and `.npz` files under `captures/` (override with `--output-dir`). The NPZ uses the same export code as `shot_tool.py`, preserving original sample indices, data-ready timestamps, trigger metadata, and quality warnings. A new capture replaces the board copy only after the previous recording has been downloaded, validated, and written to local files. Existing saved board recordings are recovered automatically when the script connects. Failed downloads leave the board copy intact.
+
+**Save capture to this device** downloads the NPZ to the browser device. **Plot capture** uses the saved sample times, including negative pre-trigger times; **Save plot as PNG** exports the plot. Unequal sensor counts alone do not establish sample loss; review the decoder's timing and quality warnings.
+
+**Cancel capture** uses the board's cancel command. Cancelling before a trigger discards that session, as on the built-in webpage; cancelling during the post-buffer can save an incomplete recording with quality warnings. Ctrl+C cancels a capture started by this script, waits for completion, and downloads any committed recording. It does not cancel a capture started by another client. Use one controlling client at a time. If communication fails, reconnect to recover any saved board recording.
+
+For phone control, keep this script running and open `http://<PC-local-IP>:8765/` on the same network. Allow Python through Windows Firewall on the private network if prompted. Wi-Fi board access now uses HTTP (normally port 80); `--wifi host:port` supports a different HTTP port. The old raw-stream `--wifi-port` option is no longer used.
+
+If the page reports a connection error, check the selected USB port or reconnect the PC to the board's Wi-Fi. Status polling retries automatically. A validation failure preserves the raw PC file and board copy, blocks replacement, and requires restarting the script to retry. A format-v5 or storage-unavailable error requires checking the installed firmware/partition table. Do not delete the board copy to work around a failed download. Press Ctrl+C once to exit and let cleanup finish.
 
 For a plot image that does not need an interactive GUI, use `--plot-png`:
 
@@ -171,7 +203,7 @@ Use `python board_control.py COM92 LEDTEST` to flash each LED individually. The 
 | `main/web_capture.c`, `main/web/` | Board-hosted phone page, WebSocket capture, plotting, and local NPZ downloads. |
 | `main/led_status.c` | Startup sequence and status indications. |
 | `inspect_raw.py` | Shared frame validation, archive handling, CLI capture, and offline plots. |
-| `capture_button.py` | Local HTTP page for repeated ten-second captures and downloads. |
+| `capture_button.py` | Local HTTP page controlling on-board captures and downloading completed recordings. |
 | `board_control.py` | USB status and diagnostic commands. |
 
 ## Stream protocol
